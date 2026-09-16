@@ -44,7 +44,8 @@ class GatewayTest(unittest.TestCase):
                 self.assertFalse(first["cache_hit"])
                 self.assertTrue(second["cache_hit"])
                 self.assertTrue(second["incremental"])
-                self.assertEqual(len(second["data"]), 1)
+                self.assertEqual(second["columns"], ["date", "code", "close"])
+                self.assertEqual(len(second["rows"]), 1)
                 self.assertEqual(gateway.storage.usage_today(), 1)
             finally:
                 gateway.close()

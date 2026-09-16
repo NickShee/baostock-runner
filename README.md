@@ -6,6 +6,7 @@
 
 - MCP 高层工具：日线、交易日历、证券列表、股票基本信息、行业分类、利润/成长/资产负债/现金流财务数据、分红、复权因子、沪深 300/上证 50/中证 500 成分股、限量批量快照；不暴露 `login/logout`。
 - SQLite 参数缓存和 JSONL 审计日志。
+- 日线事实数据按日期、代码、频率和复权方式分列存储，并建立代码/日期索引；MCP 返回使用紧凑的 `columns + rows` JSON。
 - 单连接生命周期管理、请求间隔、每日软/硬预算。
 - 错误码 `10001011` 熔断，不自动重试。
 - `BAOSTOCK_OFFLINE=true` 可在无网络/无账号环境验证 MCP 线路。
@@ -16,9 +17,17 @@
 ```bash
 mkdir -p data
 cp .env.example .env
-# 编辑 .env，填写 BAOSTOCK_USER_ID 和 BAOSTOCK_PASSWORD
+# 编辑 .env，填写 BAOSTOCK_USER_ID、BAOSTOCK_PASSWORD 和 SSD 数据目录
 docker compose up -d --build
 ```
+
+如果 NAS 上的 SSD 数据目录是 `/volume3/docker/baostock-runner/data`，设置：
+
+```env
+BAOSTOCK_HOST_DATA_DIR=/volume3/docker/baostock-runner/data
+```
+
+容器内固定使用 `/data`，数据库实际文件为 `/volume3/docker/baostock-runner/data/baostock.sqlite3`。不要把数据库目录放进镜像层。
 
 登录凭据只从环境变量读取，不会写入审计日志、SQLite 或 MCP 返回值。两个变量必须同时设置；如果都为空，则使用 BaoStock 客户端默认登录方式。不要将 `.env` 提交到版本库。
 

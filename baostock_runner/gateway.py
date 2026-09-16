@@ -66,11 +66,10 @@ class BaoStockGateway:
 
     def daily_bars(self, params: dict[str, Any]) -> dict[str, Any]:
         """Read local daily bars and only fetch the missing tail from BaoStock."""
-        series_params = {k: params[k] for k in ("code", "fields", "frequency", "adjustflag")}
-        series_key = self._key("daily_series", series_params)
+        code, frequency, adjustflag = params["code"], params["frequency"], params["adjustflag"]
         start_date, end_date = params["start_date"], params["end_date"]
-        local = self.storage.get_daily_bars(series_key, start_date, end_date)
-        latest = self.storage.latest_daily_bar(series_key)
+        local = self.storage.get_daily_bars(code, frequency, adjustflag, start_date, end_date)
+        latest = self.storage.latest_daily_bar(code, frequency, adjustflag)
         fetched = False
         if latest is None or not local:
             query_params = dict(params)
@@ -81,10 +80,21 @@ class BaoStockGateway:
         if query_params is not None:
             result = self.call("query_history_k_data_plus", query_params)
             new_rows = result["data"]
-            self.storage.put_daily_bars(series_key, new_rows)
+            self.storage.put_daily_bars(code, frequency, adjustflag, new_rows)
             fetched = not result["cache_hit"]
-            local = self.storage.get_daily_bars(series_key, start_date, end_date)
-        return {"data": local, "cache_hit": not fetched, "incremental": True, "request_count_today": self.storage.usage_today()}
+            local = self.storage.get_daily_bars(code, frequency, adjustflag, start_date, end_date)
+        columns = [field.strip() for field in params["fields"].split(",")]
+        rows = [[row.get(field) for field in columns] for row in local]
+        return {
+            "code": code,
+            "frequency": frequency,
+            "adjustflag": adjustflag,
+            "columns": columns,
+            "rows": rows,
+            "cache_hit": not fetched,
+            "incremental": True,
+            "request_count_today": self.storage.usage_today(),
+        }
 
     def _worker(self):
         bs = None
