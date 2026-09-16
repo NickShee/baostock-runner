@@ -70,7 +70,17 @@ def get_stock_basic(code: str = "", status: str = "L", fields: str = "code,code_
         raise ValueError("code must look like sh.600000, sz.000001, or bj.430047")
     if status not in {"L", "D", "P", ""}:
         raise ValueError("status must be L, D, P, or empty")
-    return gateway.call("query_stock_basic", {"code": code, "code_name": "", "fields": fields, "status": status})
+    # ``fields`` is an output projection for the MCP tool.  It is not a
+    # parameter accepted by baostock.query_stock_basic().
+    requested_fields = [field.strip() for field in fields.split(",") if field.strip()]
+    if not requested_fields:
+        raise ValueError("fields must contain at least one field")
+    result = gateway.call("query_stock_basic", {"code": code, "code_name": "", "status": status})
+    result["data"] = [
+        {field: row.get(field) for field in requested_fields}
+        for row in result.get("data", [])
+    ]
+    return result
 
 
 @mcp.tool()
