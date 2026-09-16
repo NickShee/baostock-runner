@@ -1,17 +1,25 @@
 services:
   baostock-runner:
-    build: .
+    build:
+      context: .
+      args:
+        HTTP_PROXY: ${BAOSTOCK_BUILD_HTTP_PROXY}
+        HTTPS_PROXY: ${BAOSTOCK_BUILD_HTTPS_PROXY}
+        NO_PROXY: ${BAOSTOCK_BUILD_NO_PROXY}
+    image: ghcr.io/nickshee/baostock-runner:latest
     container_name: baostock-runner
     restart: unless-stopped
     ports:
-      - "8000:8000"
+      - "8002:8000"
     volumes:
-      - ${BAOSTOCK_HOST_DATA_DIR:-./data}:/data
+      - ${BAOSTOCK_HOST_DATA_DIR}:/data
+    networks:
+      - lobehub_lobe-net
     environment:
       BAOSTOCK_DB_PATH: /data/baostock.sqlite3
       BAOSTOCK_LOG_PATH: /data/baostock-audit.jsonl
-      BAOSTOCK_USER_ID: ${BAOSTOCK_USER_ID:-}
-      BAOSTOCK_PASSWORD: ${BAOSTOCK_PASSWORD:-}
+      BAOSTOCK_USER_ID: ${BAOSTOCK_USER_ID}
+      BAOSTOCK_PASSWORD: ${BAOSTOCK_PASSWORD}
       BAOSTOCK_MCP_TRANSPORT: streamable-http
       BAOSTOCK_MCP_HOST: 0.0.0.0
       BAOSTOCK_MCP_PORT: "8000"
@@ -20,3 +28,6 @@ services:
       BAOSTOCK_DAILY_WARNING_LIMIT: "10000"
       BAOSTOCK_DAILY_HARD_LIMIT: "20000"
       BAOSTOCK_MAX_RETRIES: "2"
+networks:
+  lobehub_lobe-net:
+    external: true

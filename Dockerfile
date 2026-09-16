@@ -1,11 +1,20 @@
 FROM python:3.12-slim
 
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ARG NO_PROXY
+
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
 WORKDIR /app
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN http_proxy="${HTTP_PROXY}" \
+    https_proxy="${HTTPS_PROXY}" \
+    HTTP_PROXY="${HTTP_PROXY}" \
+    HTTPS_PROXY="${HTTPS_PROXY}" \
+    NO_PROXY="${NO_PROXY}" \
+    pip install --no-cache-dir -r requirements.txt
 
 COPY baostock_runner ./baostock_runner
 COPY README.md .
@@ -17,4 +26,3 @@ USER runner
 
 VOLUME ["/data"]
 ENTRYPOINT ["python", "-m", "baostock_runner"]
-
