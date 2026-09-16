@@ -2,11 +2,18 @@ import atexit
 import re
 from mcp.server.fastmcp import FastMCP
 
+from .config import Settings
 from .gateway import BaoStockGateway
 
 
-mcp = FastMCP("baostock-runner")
-gateway = BaoStockGateway()
+settings = Settings()
+mcp = FastMCP(
+    "baostock-runner",
+    host=settings.mcp_host,
+    port=settings.mcp_port,
+    streamable_http_path=settings.mcp_path,
+)
+gateway = BaoStockGateway(settings)
 atexit.register(gateway.close)
 
 
@@ -162,9 +169,4 @@ def main():
         return
     if settings.mcp_transport != "streamable-http":
         raise ValueError("BAOSTOCK_MCP_TRANSPORT must be streamable-http or stdio")
-    mcp.run(
-        transport="streamable-http",
-        host=settings.mcp_host,
-        port=settings.mcp_port,
-        streamable_http_path=settings.mcp_path,
-    )
+    mcp.run(transport="streamable-http")
