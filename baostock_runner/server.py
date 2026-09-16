@@ -12,6 +12,7 @@ mcp = FastMCP(
     host=settings.mcp_host,
     port=settings.mcp_port,
     streamable_http_path=settings.mcp_path,
+    stateless_http=settings.mcp_stateless,
 )
 gateway = BaoStockGateway(settings)
 atexit.register(gateway.close)

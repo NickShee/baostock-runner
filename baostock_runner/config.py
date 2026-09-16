@@ -28,3 +28,6 @@ class Settings:
     mcp_host: str = os.getenv("BAOSTOCK_MCP_HOST", "0.0.0.0")
     mcp_port: int = _int("BAOSTOCK_MCP_PORT", 8000)
     mcp_path: str = os.getenv("BAOSTOCK_MCP_PATH", "/mcp")
+    # True = stateless Streamable HTTP (no session tracking, no 404 "Session not found"
+    # after idle timeout). Fixes disconnects through reverse proxies / long idle gaps.
+    mcp_stateless: bool = os.getenv("BAOSTOCK_MCP_STATELESS", "true").lower() == "true"
