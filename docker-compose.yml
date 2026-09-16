@@ -1,0 +1,22 @@
+services:
+  baostock-runner:
+    build: .
+    container_name: baostock-runner
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/data
+    environment:
+      BAOSTOCK_DB_PATH: /data/baostock.sqlite3
+      BAOSTOCK_LOG_PATH: /data/baostock-audit.jsonl
+      BAOSTOCK_USER_ID: ${BAOSTOCK_USER_ID:-}
+      BAOSTOCK_PASSWORD: ${BAOSTOCK_PASSWORD:-}
+      BAOSTOCK_MCP_TRANSPORT: streamable-http
+      BAOSTOCK_MCP_HOST: 0.0.0.0
+      BAOSTOCK_MCP_PORT: "8000"
+      BAOSTOCK_MCP_PATH: /mcp
+      BAOSTOCK_MIN_INTERVAL_SECONDS: "1.0"
+      BAOSTOCK_DAILY_WARNING_LIMIT: "10000"
+      BAOSTOCK_DAILY_HARD_LIMIT: "20000"
+      BAOSTOCK_MAX_RETRIES: "2"
