@@ -31,6 +31,12 @@ services:
       BAOSTOCK_DAILY_WARNING_LIMIT: "10000"
       BAOSTOCK_DAILY_HARD_LIMIT: "20000"
       BAOSTOCK_MAX_RETRIES: "2"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; s=socket.create_connection(('127.0.0.1', 8000), 3); s.close()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
 networks:
   lobehub_lobe-net:
     external: true
