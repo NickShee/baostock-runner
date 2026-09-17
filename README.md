@@ -11,6 +11,7 @@
 - 错误码 `10001011` 熔断，不自动重试。
 - `BAOSTOCK_OFFLINE=true` 可在无网络/无账号环境验证 MCP 线路。
 - 日线写入本地 `daily_bars` 表；再次请求相同股票/周期/复权方式时只补本地缺失的尾部日期。
+- 会话保活与失败重连：空闲超过阈值主动重连，失败重试耗尽后重连一轮，登录后轻量验证通道。
 
 ## 启动
 
@@ -71,6 +72,16 @@ get_index_constituents(index, date)
 get_latest_stock_snapshot(codes, adjust)
 gateway_status()
 ```
+
+## 会话保活与重连（v0.9.x+）
+
+BaoStock 免费长连接在服务端空闲超时或波动时会静默断开。本版本内置三层容错：
+
+| 环境变量 | 默认值 | 说明 |
+|---|---|---|
+| `BAOSTOCK_SESSION_IDLE_TIMEOUT_SECONDS` | `1800` | 距上次查询超过该秒数，下次查询前主动重连 |
+| `BAOSTOCK_RECONNECT_ON_FAILURE` | `true` | 查询失败（非黑名单）且重试耗尽后，重连一次再试 |
+| `BAOSTOCK_VERIFY_AFTER_LOGIN` | `true` | 登录后用 `query_stock_basic` 轻量验证通道真实可用 |
 
 ## 生产前必须补强
 
