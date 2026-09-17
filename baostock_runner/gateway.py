@@ -24,6 +24,7 @@ SUPPORTED_METHODS = {
     "query_history_k_data_plus", "query_trade_dates", "query_all_stock",
     "query_stock_basic", "query_stock_industry", "query_profit_data",
     "query_growth_data", "query_balance_data", "query_cash_flow_data",
+    "query_operation_data", "query_dupont_data",
     "query_dividend_data", "query_adjust_factor",
     "query_hs300_stocks", "query_sz50_stocks", "query_zz500_stocks",
 }
@@ -34,6 +35,8 @@ class Job:
     method: str
     params: dict[str, Any]
     result: queue.Queue
+    # False = 绕过参数缓存（后台 fetcher 使用，确保拿到远端最新数据且不污染 cache）。
+    use_cache: bool = True
 
 
 class BaoStockGateway:
@@ -57,7 +60,7 @@ class BaoStockGateway:
         self.jobs.put(None)
         self.worker.join(timeout=10)
 
-    def call(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+    def call(self, method: str, params: dict[str, Any], use_cache: bool = True) -> dict[str, Any]:
         if not self.ready.wait(timeout=15):
             raise RuntimeError("BaoStock worker did not become ready")
         if self.startup_error is not None:
@@ -65,18 +68,19 @@ class BaoStockGateway:
         if self.breaker.is_set():
             raise RuntimeError("BaoStock circuit breaker is open; manual intervention required")
         key = hashlib.sha256(json.dumps({"method": method, "params": params}, sort_keys=True).encode()).hexdigest()
-        cached = self.storage.get_cache(key)
-        if cached is not None:
-            self.storage.audit({"interface": method, **params, "cache_hit": True, "request_count_today": self.storage.usage_today(), "error_code": "0"})
-            return {"data": cached, "cache_hit": True, "request_count_today": self.storage.usage_today()}
+        if use_cache:
+            cached = self.storage.get_cache(key)
+            if cached is not None:
+                self.storage.audit({"interface": method, **params, "cache_hit": True, "request_count_today": self.storage.usage_today(), "error_code": "0"})
+                return {"data": cached, "cache_hit": True, "request_count_today": self.storage.usage_today()}
         result: queue.Queue = queue.Queue(maxsize=1)
-        self.jobs.put(Job(method, params, result))
+        self.jobs.put(Job(method, params, result, use_cache))
         ok, value = result.get()
         if not ok:
             raise value
         return value
 
-    def daily_bars(self, params: dict[str, Any]) -> dict[str, Any]:
+    def daily_bars(self, params: dict[str, Any], use_cache: bool = True) -> dict[str, Any]:
         """Read local daily bars and only fetch the missing tail from BaoStock."""
         code, frequency, adjustflag = params["code"], params["frequency"], params["adjustflag"]
         start_date, end_date = params["start_date"], params["end_date"]
@@ -90,7 +94,7 @@ class BaoStockGateway:
         else:
             query_params = None
         if query_params is not None:
-            result = self.call("query_history_k_data_plus", query_params)
+            result = self.call("query_history_k_data_plus", query_params, use_cache=use_cache)
             new_rows = result["data"]
             self.storage.put_daily_bars(code, frequency, adjustflag, new_rows)
             fetched = not result["cache_hit"]
@@ -134,7 +138,7 @@ class BaoStockGateway:
                 if job is None:
                     break
                 try:
-                    value = self._execute_robust(bs, job.method, job.params)
+                    value = self._execute_robust(bs, job.method, job.params, job.use_cache)
                     job.result.put((True, value))
                 except Exception as exc:
                     job.result.put((False, exc))
@@ -180,28 +184,28 @@ class BaoStockGateway:
                     raise RuntimeError(f"BaoStock post-login verification failed: {rs.error_code} {rs.error_msg}")
             self.last_activity = time.monotonic()
 
-    def _execute_robust(self, bs, method: str, p: dict[str, Any]):
+    def _execute_robust(self, bs, method: str, p: dict[str, Any], use_cache: bool = True):
         """健壮执行路径：先保证会话新鲜，失败后视类型重连一轮再试。"""
         if self.storage.usage_today() >= self.settings.daily_hard_limit:
             raise RuntimeError("Daily BaoStock request hard limit reached")
         if self.settings.offline:
-            return self._execute(bs, method, p)
+            return self._execute(bs, method, p, use_cache)
         if not self._session_fresh():
             self._reconnect(bs)
         try:
-            return self._execute(bs, method, p)
+            return self._execute(bs, method, p, use_cache)
         except ReconnectableFailure:
             if not (self.settings.reconnect_on_failure and not self.breaker.is_set()):
                 raise
             self._reconnect(bs)
-            return self._execute(bs, method, p)
+            return self._execute(bs, method, p, use_cache)
         except RECONNECTABLE_NETWORK_EXC:
             if not (self.settings.reconnect_on_failure and not self.breaker.is_set()):
                 raise
             self._reconnect(bs)
-            return self._execute(bs, method, p)
+            return self._execute(bs, method, p, use_cache)
 
-    def _execute(self, bs, method: str, p: dict[str, Any]):
+    def _execute(self, bs, method: str, p: dict[str, Any], use_cache: bool = True):
         if self.storage.usage_today() >= self.settings.daily_hard_limit:
             raise RuntimeError("Daily BaoStock request hard limit reached")
         if self.settings.offline:
@@ -233,7 +237,8 @@ class BaoStockGateway:
                 rows.append(dict(zip(rs.fields, rs.get_row_data())))
             count = self.storage.increment_usage()
         payload = {"data": rows, "cache_hit": False, "request_count_today": count}
-        self.storage.put_cache(self._key(method, p), rows)
+        if use_cache:
+            self.storage.put_cache(self._key(method, p), rows)
         self.storage.audit({"interface": method, **p, "cache_hit": False, "request_count_today": count, "error_code": "0"})
         return payload
 

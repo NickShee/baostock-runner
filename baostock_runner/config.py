@@ -38,3 +38,28 @@ class Settings:
     # True = stateless Streamable HTTP (no session tracking, no 404 "Session not found"
     # after idle timeout). Fixes disconnects through reverse proxies / long idle gaps.
     mcp_stateless: bool = os.getenv("BAOSTOCK_MCP_STATELESS", "true").lower() == "true"
+    # --- background fetcher (P1) ---
+    # 后台分批次下载器开关。关闭后仅保留 MCP 按需拉取行为（原有行为不变）。
+    fetch_enabled: bool = os.getenv("BAOSTOCK_FETCH_ENABLED", "true").lower() == "true"
+    # 股票池：hs300 = 沪深300 成分股（P1 实现）；all = 全 A 股（预留扩展位）。
+    fetch_universe: str = os.getenv("BAOSTOCK_FETCH_UNIVERSE", "hs300")
+    # fetcher 占每日总预算（daily_hard_limit）的比例。默认 2/3，保证 MCP 至少保留 1/3。
+    fetch_budget_ratio: float = _float("BAOSTOCK_FETCH_BUDGET_RATIO", 0.67)
+    # 每批处理的股票数量（分批次下载的粒度）。
+    fetch_batch_size: int = _int("BAOSTOCK_FETCH_BATCH_SIZE", 50)
+    # 日线回填起点（首次全量回填的开始日期）。
+    fetch_daily_start_date: str = os.getenv("BAOSTOCK_FETCH_DAILY_START_DATE", "2018-01-01")
+    # 财务回填起点年份（含），倒序补齐到当前年。
+    fetch_financial_start_year: int = _int("BAOSTOCK_FETCH_FINANCIAL_START_YEAR", 2022)
+    # 财务回填 dataset 列表，逗号分隔：profit,growth,balance,cash_flow,operation,dupont
+    fetch_financial_datasets: str = os.getenv("BAOSTOCK_FETCH_FINANCIAL_DATASETS", "profit")
+    # 日线缓存复权方式，逗号分隔：3=不复权, 1=后复权, 2=前复权
+    fetch_adjustflags: str = os.getenv("BAOSTOCK_FETCH_ADJUSTFLAGS", "3")
+    # 是否回填分红数据
+    fetch_include_dividends: bool = os.getenv("BAOSTOCK_FETCH_INCLUDE_DIVIDENDS", "false").lower() == "true"
+    # 是否回填复权因子
+    fetch_include_adjust_factors: bool = os.getenv("BAOSTOCK_FETCH_INCLUDE_ADJUST_FACTORS", "false").lower() == "true"
+    # 全部任务追上最新后，空闲轮询间隔（秒）。
+    fetch_idle_sleep_seconds: int = _int("BAOSTOCK_FETCH_IDLE_SLEEP_SECONDS", 300)
+    # 预算耗尽后的暂停检查间隔（秒）；按天计数，跨天自动恢复。
+    fetch_pause_sleep_seconds: int = _int("BAOSTOCK_FETCH_PAUSE_SLEEP_SECONDS", 600)

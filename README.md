@@ -71,7 +71,52 @@ get_adjust_factor(code, start_date, end_date)
 get_index_constituents(index, date)
 get_latest_stock_snapshot(codes, adjust)
 gateway_status()
+# P1 后台下载器管理工具
+start_backfill(dataset)
+get_backfill_status()
+get_market_coverage()
 ```
+
+## 后台分批次下载器（P1）
+
+启动后 fetcher 线程自动运行：先初始化股票池（hs300 成分 + 基本信息 + 交易日历 + 行业），
+然后按批次把日线/财务数据下载到本地 SQLite 事实表，MCP 读取工具优先命中本地数据。
+所有 BaoStock 请求仍走唯一 worker 队列（官方限制：BaoStock 非线程安全），与 MCP 请求共享连接。
+
+- 分批次：`BAOSTOCK_FETCH_BATCH_SIZE`（默认 50）只/批；每批完成后回到主循环，便于预算/心跳控制。
+- 断点续传：`download_jobs` 表记录每个批次状态，重启后自动跳过已完成项。
+- 当日去重：日线当天已补完的股票当天不再重复拉取；跨天自动重新检查（每日增量）。
+- 幂等：所有事实表复合主键 + `INSERT OR REPLACE`，可重复执行。
+- 会话保活：与 MCP 请求共享 gateway 的会话新鲜检查/失败重连。
+
+### 预算隔离（不抢占 MCP 额度）
+
+| 环境变量 | 默认值 | 说明 |
+|---|---|---|
+| `BAOSTOCK_FETCH_BUDGET_RATIO` | `0.67` | fetcher 占每日总预算 `BAOSTOCK_DAILY_HARD_LIMIT` 的比例（2/3） |
+| `BAOSTOCK_FETCH_PAUSE_SLEEP_SECONDS` | `600` | 预算耗尽后的暂停检查间隔；按天计数，跨天自动恢复 |
+
+fetcher 使用独立的 `download_usage` 计数，硬顶 = `hard_limit × ratio`；达到即**软暂停**
+（不抛错、不抢占），MCP 至少保留 `hard_limit × (1-ratio)`（默认 1/3）额度。
+`get_backfill_status` 返回预算拆分与各数据集任务统计。
+
+### 其他 fetcher 环境变量
+
+| 环境变量 | 默认值 | 说明 |
+|---|---|---|
+| `BAOSTOCK_FETCH_ENABLED` | `true` | 后台下载器总开关 |
+| `BAOSTOCK_FETCH_UNIVERSE` | `hs300` | 股票池：hs300（P1 实现）；all 预留 |
+| `BAOSTOCK_FETCH_DAILY_START_DATE` | `2018-01-01` | 日线回填起点 |
+| `BAOSTOCK_FETCH_FINANCIAL_START_YEAR` | `2022` | 财务回填起点年份（含），倒序补到当前年 |
+| `BAOSTOCK_FETCH_FINANCIAL_DATASETS` | `profit` | 财务 dataset：profit,growth,balance,cash_flow,operation,dupont |
+| `BAOSTOCK_FETCH_ADJUSTFLAGS` | `3` | 日线复权方式：3=不复权,1=后复权,2=前复权 |
+| `BAOSTOCK_FETCH_INCLUDE_DIVIDENDS` | `false` | 是否回填分红 |
+| `BAOSTOCK_FETCH_INCLUDE_ADJUST_FACTORS` | `false` | 是否回填复权因子 |
+| `BAOSTOCK_FETCH_IDLE_SLEEP_SECONDS` | `300` | 全部追上最新后的空闲轮询间隔 |
+
+新增 SQLite 事实表：`securities`、`trade_calendar`、`index_constituents`、`financials`、
+`dividends`、`adjust_factors`、`stock_industry`；任务表 `download_jobs`；预算表 `download_usage`；
+元数据表 `dataset_meta`。均为 `CREATE TABLE IF NOT EXISTS`，不影响既有表与旧镜像回滚。
 
 ## 会话保活与重连（v0.9.x+）
 

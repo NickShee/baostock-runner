@@ -3,6 +3,7 @@ import re
 from mcp.server.fastmcp import FastMCP
 
 from .config import Settings
+from .fetcher import Fetcher
 from .gateway import BaoStockGateway
 
 
@@ -15,7 +16,9 @@ mcp = FastMCP(
     stateless_http=settings.mcp_stateless,
 )
 gateway = BaoStockGateway(settings)
+fetcher = Fetcher(gateway, settings)
 atexit.register(gateway.close)
+atexit.register(fetcher.stop)
 
 
 @mcp.tool()
@@ -75,7 +78,9 @@ def get_stock_basic(code: str = "", status: str = "L", fields: str = "code,code_
     requested_fields = [field.strip() for field in fields.split(",") if field.strip()]
     if not requested_fields:
         raise ValueError("fields must contain at least one field")
-    result = gateway.call("query_stock_basic", {"code": code, "code_name": "", "status": status})
+    # baostock.query_stock_basic(code='', code_name='') -- 无 status 参数；
+    # status 仅作为 MCP 层的投影过滤条件，透传会触发 TypeError。
+    result = gateway.call("query_stock_basic", {"code": code, "code_name": ""})
     result["data"] = [
         {field: row.get(field) for field in requested_fields}
         for row in result.get("data", [])
@@ -170,14 +175,90 @@ def gateway_status() -> dict:
         "circuit_breaker_open": gateway.breaker.is_set(),
         "queue_length": gateway.jobs.qsize(),
         "offline": gateway.settings.offline,
+        "fetcher_budget_left": fetcher.budget_left(),
+    }
+
+
+@mcp.tool()
+def start_backfill(dataset: str = "auto") -> dict:
+    """Trigger the background fetcher (wake it up) and return its state.
+
+    dataset: auto | daily_bars | financials | dividends | adjust_factors |
+             securities | calendar | industry | index_constituents
+    The fetcher runs continuously; this tool only nudges it to poll immediately.
+    """
+    if settings.offline:
+        return {"ok": False, "reason": "offline mode", "state": fetcher.state}
+    fetcher.wake(dataset)
+    return {
+        "ok": True,
+        "state": fetcher.state,
+        "budget": {
+            "total_hard_limit": settings.daily_hard_limit,
+            "fetcher_budget": fetcher.fetch_budget,
+            "fetcher_used_today": gateway.storage.download_usage_today(),
+            "fetcher_left": fetcher.budget_left(),
+        },
+    }
+
+
+@mcp.tool()
+def get_backfill_status() -> dict:
+    """Return background fetcher status, budget split, and per-dataset job stats."""
+    storage = gateway.storage
+    return {
+        "state": fetcher.state,
+        "budget": {
+            "ratio": settings.fetch_budget_ratio,
+            "total_hard_limit": settings.daily_hard_limit,
+            "fetcher_budget": fetcher.fetch_budget,
+            "fetcher_used_today": storage.download_usage_today(),
+            "fetcher_left": fetcher.budget_left(),
+            "mcp_used_today": storage.usage_today(),
+            "mcp_reserved": settings.daily_hard_limit - fetcher.fetch_budget,
+        },
+        "jobs": {
+            ds: storage.job_stats(ds)
+            for ds in ("daily_bars", "financials", "dividends", "adjust_factors")
+        },
+        "settings": {
+            "fetch_enabled": settings.fetch_enabled,
+            "fetch_universe": settings.fetch_universe,
+            "fetch_daily_start_date": settings.fetch_daily_start_date,
+            "fetch_financial_start_year": settings.fetch_financial_start_year,
+            "fetch_financial_datasets": settings.fetch_financial_datasets,
+            "fetch_adjustflags": settings.fetch_adjustflags,
+            "fetch_batch_size": settings.fetch_batch_size,
+        },
+    }
+
+
+@mcp.tool()
+def get_market_coverage() -> dict:
+    """Return local SQLite coverage: row counts and freshness per dataset."""
+    storage = gateway.storage
+    latest_fin = storage.latest_financial_period("profit")
+    return {
+        "securities": storage.count_securities(),
+        "trade_calendar_days": storage.count_rows("trade_calendar"),
+        "daily_bars_rows": storage.count_rows("daily_bars"),
+        "industry_rows": storage.count_rows("stock_industry"),
+        "financials_rows": storage.count_rows("financials"),
+        "financials_latest_period": latest_fin,
+        "dividends_rows": storage.count_rows("dividends"),
+        "adjust_factors_rows": storage.count_rows("adjust_factors"),
+        "index_constituents_rows": storage.count_rows("index_constituents"),
+        "db_path": storage.db_path,
     }
 
 
 def main():
     settings = gateway.settings
     if settings.mcp_transport == "stdio":
+        # stdio 模式仅用于调试/单客户端，不启动后台 fetcher。
         mcp.run(transport="stdio")
         return
     if settings.mcp_transport != "streamable-http":
         raise ValueError("BAOSTOCK_MCP_TRANSPORT must be streamable-http or stdio")
+    fetcher.start()
     mcp.run(transport="streamable-http")
