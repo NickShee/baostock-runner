@@ -2,6 +2,7 @@ from dataclasses import dataclass
 import hashlib
 import json
 import queue
+import socket
 import threading
 import time
 from typing import Any
@@ -11,6 +12,14 @@ from .storage import Storage
 
 
 BLACKLIST_CODE = "10001011"
+# 网络层异常：连接被重置/超时/拒绝。出现这类异常时应重连而非盲目重试原会话。
+RECONNECTABLE_NETWORK_EXC = (ConnectionError, socket.timeout, BrokenPipeError, OSError)
+
+
+class ReconnectableFailure(RuntimeError):
+    """BaoStock 查询在重试耗尽后仍失败，可能通过重连恢复（非黑名单、非纯参数错误）。"""
+
+
 SUPPORTED_METHODS = {
     "query_history_k_data_plus", "query_trade_dates", "query_all_stock",
     "query_stock_basic", "query_stock_industry", "query_profit_data",
@@ -37,6 +46,9 @@ class BaoStockGateway:
         self.breaker = threading.Event()
         self.ready = threading.Event()
         self.startup_error: Exception | None = None
+        # 会话保活：记录最后一次成功活动的时间（monotonic），超时则主动重连。
+        self.last_activity = time.monotonic()
+        self.session_lock = threading.Lock()
         self.worker = threading.Thread(target=self._worker, name="baostock-single-worker", daemon=True)
         self.worker.start()
 
@@ -115,13 +127,14 @@ class BaoStockGateway:
                         self.breaker.set()
                     raise RuntimeError(f"BaoStock login failed: {login.error_code} {login.error_msg}")
                 logged_in = True
+                self.last_activity = time.monotonic()
             self.ready.set()
             while not self.stop_event.is_set():
                 job = self.jobs.get()
                 if job is None:
                     break
                 try:
-                    value = self._execute(bs, job.method, job.params)
+                    value = self._execute_robust(bs, job.method, job.params)
                     job.result.put((True, value))
                 except Exception as exc:
                     job.result.put((False, exc))
@@ -138,6 +151,55 @@ class BaoStockGateway:
         finally:
             if logged_in and bs is not None:
                 bs.logout()
+
+    def _session_fresh(self) -> bool:
+        """距上一次成功活动是否仍在会话空闲超时阈值内。"""
+        return (time.monotonic() - self.last_activity) < self.settings.session_idle_timeout_seconds
+
+    def _reconnect(self, bs) -> None:
+        """主动重建 BaoStock 会话：logout -> login -> 轻量查询验证。"""
+        with self.session_lock:
+            try:
+                if bs is not None and bs.is_login():
+                    bs.logout()
+            except Exception:
+                pass
+            time.sleep(1)
+            login = (
+                bs.login(user_id=self.settings.user_id, password=self.settings.password)
+                if self.settings.user_id
+                else bs.login()
+            )
+            if login.error_code != "0":
+                if login.error_code == BLACKLIST_CODE:
+                    self.breaker.set()
+                raise RuntimeError(f"BaoStock re-login failed: {login.error_code} {login.error_msg}")
+            if self.settings.verify_after_login:
+                rs = bs.query_stock_basic(code="sh.000001")
+                if rs.error_code != "0":
+                    raise RuntimeError(f"BaoStock post-login verification failed: {rs.error_code} {rs.error_msg}")
+            self.last_activity = time.monotonic()
+
+    def _execute_robust(self, bs, method: str, p: dict[str, Any]):
+        """健壮执行路径：先保证会话新鲜，失败后视类型重连一轮再试。"""
+        if self.storage.usage_today() >= self.settings.daily_hard_limit:
+            raise RuntimeError("Daily BaoStock request hard limit reached")
+        if self.settings.offline:
+            return self._execute(bs, method, p)
+        if not self._session_fresh():
+            self._reconnect(bs)
+        try:
+            return self._execute(bs, method, p)
+        except ReconnectableFailure:
+            if not (self.settings.reconnect_on_failure and not self.breaker.is_set()):
+                raise
+            self._reconnect(bs)
+            return self._execute(bs, method, p)
+        except RECONNECTABLE_NETWORK_EXC:
+            if not (self.settings.reconnect_on_failure and not self.breaker.is_set()):
+                raise
+            self._reconnect(bs)
+            return self._execute(bs, method, p)
 
     def _execute(self, bs, method: str, p: dict[str, Any]):
         if self.storage.usage_today() >= self.settings.daily_hard_limit:
@@ -162,9 +224,10 @@ class BaoStockGateway:
                     self.breaker.set()
                     raise RuntimeError(f"BaoStock query failed: {rs.error_code} {rs.error_msg}")
                 if attempt + 1 == attempts:
-                    raise RuntimeError(f"BaoStock query failed after {attempts} attempts: {rs.error_code} {rs.error_msg}")
+                    raise ReconnectableFailure(f"BaoStock query failed after {attempts} attempts: {rs.error_code} {rs.error_msg}")
                 delay = self.settings.retry_delays[min(attempt, len(self.settings.retry_delays) - 1)] if self.settings.retry_delays else 5
                 time.sleep(delay)
+            self.last_activity = time.monotonic()
             rows = []
             while rs.next():
                 rows.append(dict(zip(rs.fields, rs.get_row_data())))
