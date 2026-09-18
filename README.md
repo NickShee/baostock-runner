@@ -36,11 +36,22 @@
 
 数据流：`BaoStock → fetcher/gateway（单队列）→ SQLite 事实表 → MCP 读取工具命中本地`。审计日志 `baostock-audit.jsonl` 记录每次请求。
 
+### 优先级队列（MCP 查询插队）
+
+`gateway.jobs` 使用 `queue.PriorityQueue`：**MCP 查询（priority=0）总排到后台 fetcher（priority=1）前面**，同优先级按入队顺序 FIFO。
+
+- fetcher 每个请求标记 `priority=1`（`_bounded_call` / `daily_bars` 透传）。
+- worker 完成当前请求后优先处理 MCP 请求，再继续 fetcher——**MCP 实时查询不被后台回填阻塞**，无需暂停 fetcher 或把下载挪到闲时。
+- 生产实测：财务回填进行中查询 2013 年历史日线（需拉 BaoStock）耗时 4.3s 返回；同场景优化前排队 218s 未完成。
+
 ## 后台分批次下载器（P1）
 
 启动后 fetcher 线程自动运行：先初始化股票池（hs300 成分 + 基本信息 + 交易日历 + 行业），然后按批次把日线/财务数据下载到本地 SQLite 事实表。所有 BaoStock 请求仍走唯一 worker 队列，与 MCP 请求共享连接与会话保活。
 
 - 分批次：`BAOSTOCK_FETCH_BATCH_SIZE`（默认 50）只/批；每批完成后回到主循环。
+- **MCP 插队优先**：队列为优先级队列，MCP 查询（priority=0）总排到 fetcher（priority=1）前面；
+  后台回填进行时实时查询仍秒级响应（生产实测：fetcher 繁忙时历史查询 ~4s 返回，此前排队可卡数分钟），
+  查询完成后再继续 fetcher，无需暂停/错峰。
 - 断点续传：`download_jobs` 表记录每个批次状态，重启后自动跳过已完成项。
 - 当日去重：日线当天已补完的股票当天不再重复拉取；跨天自动重新检查（每日增量）。
 - 幂等：所有事实表复合主键 + `INSERT OR REPLACE`，可重复执行。
