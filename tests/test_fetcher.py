@@ -1,5 +1,7 @@
 import os
 import tempfile
+import threading
+import time
 import unittest
 
 from baostock_runner.config import Settings
@@ -212,6 +214,45 @@ class FetcherBudgetTest(unittest.TestCase):
                 # Q4 已 done 被跳过，查询应落在 2026Q3
                 rows = storage.get_financials("profit", "sh.600000")
                 self.assertEqual(rows[0]["quarter"], 3)
+            finally:
+                gateway.close()
+
+
+class GatewayPriorityTest(unittest.TestCase):
+    def test_mcp_request_preempts_fetcher_in_queue(self):
+        """回归：MCP 查询（priority=0）插入 fetcher（priority=1）请求之间时，
+        worker 必须先执行 MCP 请求，再继续 fetcher 请求。"""
+        with tempfile.TemporaryDirectory() as d:
+            settings = _settings(d, min_interval_seconds=0, daily_hard_limit=1000,
+                                 fetch_budget_ratio=0.5, offline=True)
+            gateway = BaoStockGateway(settings)
+            order = []
+            orig_execute = gateway._execute
+
+            def tracked(bs, method, p, use_cache=True):
+                order.append(method)
+                return orig_execute(bs, method, p, use_cache)
+
+            gateway._execute = tracked
+            try:
+                def fetcher_flow():
+                    # fetcher：先入队一个低优先级请求，稍后再入队第二个
+                    gateway.call("query_trade_dates",
+                                 {"start_date": "2026-01-01", "end_date": "2026-01-31"},
+                                 use_cache=False, priority=1)
+                    time.sleep(0.15)  # 窗口：让 MCP 请求插队
+                    gateway.call("query_all_stock", {"trade_date": "2026-01-05"},
+                                 use_cache=False, priority=1)
+
+                t = threading.Thread(target=fetcher_flow)
+                t.start()
+                time.sleep(0.03)
+                # MCP 高优先级请求插入（此时队列中已有第二个 fetcher 请求在等）
+                gateway.call("query_stock_basic", {"code": "", "code_name": ""}, priority=0)
+                t.join()
+                # MCP 必须在第二个 fetcher 请求之前执行
+                self.assertLess(order.index("query_stock_basic"), order.index("query_all_stock"))
+                self.assertEqual(order[0], "query_trade_dates")
             finally:
                 gateway.close()
 

@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 import hashlib
+import itertools
 import json
 import queue
 import socket
@@ -37,6 +38,9 @@ class Job:
     result: queue.Queue
     # False = 绕过参数缓存（后台 fetcher 使用，确保拿到远端最新数据且不污染 cache）。
     use_cache: bool = True
+    # 队列优先级：0 = MCP 查询（最高，插队）；1 = 后台 fetcher（让位）。
+    # worker 始终优先取优先级最小的 Job。
+    priority: int = 0
 
 
 class BaoStockGateway:
@@ -44,7 +48,10 @@ class BaoStockGateway:
     def __init__(self, settings: Settings | None = None):
         self.settings = settings or Settings()
         self.storage = Storage(self.settings.db_path, self.settings.log_path)
-        self.jobs: queue.Queue[Job | None] = queue.Queue()
+        # 优先级队列：MCP 查询（priority=0）总排到 fetcher（priority=1）前面；
+        # 同优先级用递增序号保证 FIFO，不比较 Job 对象本身。
+        self.jobs: queue.PriorityQueue = queue.PriorityQueue()
+        self._seq = itertools.count()
         self.stop_event = threading.Event()
         self.breaker = threading.Event()
         self.ready = threading.Event()
@@ -57,10 +64,10 @@ class BaoStockGateway:
 
     def close(self):
         self.stop_event.set()
-        self.jobs.put(None)
+        self.jobs.put((-1, next(self._seq), None))
         self.worker.join(timeout=10)
 
-    def call(self, method: str, params: dict[str, Any], use_cache: bool = True) -> dict[str, Any]:
+    def call(self, method: str, params: dict[str, Any], use_cache: bool = True, priority: int = 0) -> dict[str, Any]:
         if not self.ready.wait(timeout=15):
             raise RuntimeError("BaoStock worker did not become ready")
         if self.startup_error is not None:
@@ -74,13 +81,13 @@ class BaoStockGateway:
                 self.storage.audit({"interface": method, **params, "cache_hit": True, "request_count_today": self.storage.usage_today(), "error_code": "0"})
                 return {"data": cached, "cache_hit": True, "request_count_today": self.storage.usage_today()}
         result: queue.Queue = queue.Queue(maxsize=1)
-        self.jobs.put(Job(method, params, result, use_cache))
+        self.jobs.put((priority, next(self._seq), Job(method, params, result, use_cache, priority)))
         ok, value = result.get()
         if not ok:
             raise value
         return value
 
-    def daily_bars(self, params: dict[str, Any], use_cache: bool = True) -> dict[str, Any]:
+    def daily_bars(self, params: dict[str, Any], use_cache: bool = True, priority: int = 0) -> dict[str, Any]:
         """Read local daily bars and only fetch the missing tail from BaoStock."""
         code, frequency, adjustflag = params["code"], params["frequency"], params["adjustflag"]
         start_date, end_date = params["start_date"], params["end_date"]
@@ -94,7 +101,7 @@ class BaoStockGateway:
         else:
             query_params = None
         if query_params is not None:
-            result = self.call("query_history_k_data_plus", query_params, use_cache=use_cache)
+            result = self.call("query_history_k_data_plus", query_params, use_cache=use_cache, priority=priority)
             new_rows = result["data"]
             self.storage.put_daily_bars(code, frequency, adjustflag, new_rows)
             fetched = not result["cache_hit"]
@@ -134,7 +141,7 @@ class BaoStockGateway:
                 self.last_activity = time.monotonic()
             self.ready.set()
             while not self.stop_event.is_set():
-                job = self.jobs.get()
+                _, _, job = self.jobs.get()
                 if job is None:
                     break
                 try:
@@ -147,7 +154,7 @@ class BaoStockGateway:
             self.ready.set()
             while True:
                 try:
-                    job = self.jobs.get_nowait()
+                    _, _, job = self.jobs.get_nowait()
                 except queue.Empty:
                     break
                 if job is not None:

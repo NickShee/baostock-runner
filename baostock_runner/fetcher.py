@@ -297,7 +297,7 @@ class Fetcher:
                     "end_date": latest,
                     "frequency": "d",
                     "adjustflag": af,
-                }, use_cache=False)
+                }, use_cache=False, priority=1)
                 # 真实请求成功后才计入下载预算（gateway 侧只计总 usage）。
                 self.storage.increment_download_usage()
                 self.storage.job_upsert("daily_bars", f"{code}|{af}", "done")
@@ -380,10 +380,13 @@ class Fetcher:
     # ---------- helper ----------
 
     def _bounded_call(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
-        """带预算闸门的 gateway 调用：强制绕过参数缓存并计入 download_usage。"""
+        """带预算闸门的 gateway 调用：强制绕过参数缓存并计入 download_usage。
+
+        priority=1：fetcher 请求为低优先级，MCP 查询（priority=0）可插队。
+        """
         if self.budget_left() <= 0:
             raise BudgetExhausted()
-        result = self.gateway.call(method, params, use_cache=False)
+        result = self.gateway.call(method, params, use_cache=False, priority=1)
         # 真实请求成功后才计入下载预算（gateway 侧只计总 usage）。
         self.storage.increment_download_usage()
         return result
