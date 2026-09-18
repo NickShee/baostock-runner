@@ -165,6 +165,56 @@ class FetcherBudgetTest(unittest.TestCase):
             finally:
                 gateway.close()
 
+    def test_step_once_proceeds_to_financials_after_daily_done(self):
+        """回归：日线无待补后，_step_once 必须继续进入财务阶段（不可被短路截断）。"""
+        with tempfile.TemporaryDirectory() as d:
+            settings = _settings(d, min_interval_seconds=0, daily_hard_limit=100,
+                                 fetch_budget_ratio=0.5, offline=True,
+                                 fetch_financial_start_year=2025)
+            gateway = BaoStockGateway(settings)
+            fetcher = Fetcher(gateway, settings)
+            try:
+                storage = gateway.storage
+                # 基础数据就绪（跳过 init 阶段）
+                storage.put_securities([{"code": "sh.600000", "name": "浦发", "status": "1"}])
+                storage.set_meta("trade_calendar", detail="ready")
+                storage.set_meta("stock_industry", detail="ready")
+                storage.set_meta("index_constituents", detail="ready")
+                # 日线"已到最新"：写入未来日期 bar，确保 pending 为空
+                storage.put_daily_bars("sh.600000", "d", "3",
+                                       [{"date": "2099-01-01", "code": "sh.600000", "close": "10"}])
+                worked = fetcher._step_once()
+                self.assertTrue(worked)
+                self.assertGreater(storage.count_rows("financials"), 0)
+            finally:
+                gateway.close()
+
+    def test_financial_empty_period_skipped_after_done(self):
+        """回归：空报告期（未发布季度）标记 done 后不得反复查询（防死循环）。"""
+        with tempfile.TemporaryDirectory() as d:
+            settings = _settings(d, min_interval_seconds=0, daily_hard_limit=100,
+                                 fetch_budget_ratio=0.5, offline=True,
+                                 fetch_financial_start_year=2026)
+            gateway = BaoStockGateway(settings)
+            fetcher = Fetcher(gateway, settings)
+            try:
+                storage = gateway.storage
+                storage.put_securities([{"code": "sh.600000", "name": "浦发", "status": "1"}])
+                storage.set_meta("trade_calendar", detail="ready")
+                storage.set_meta("stock_industry", detail="ready")
+                storage.set_meta("index_constituents", detail="ready")
+                storage.put_daily_bars("sh.600000", "d", "3",
+                                       [{"date": "2099-01-01", "code": "sh.600000", "close": "10"}])
+                # 模拟空报告期已 done（financials 表无行）
+                storage.job_upsert("financials", "sh.600000|2026Q4|profit", "done")
+                worked = fetcher._step_once()
+                self.assertTrue(worked)
+                # Q4 已 done 被跳过，查询应落在 2026Q3
+                rows = storage.get_financials("profit", "sh.600000")
+                self.assertEqual(rows[0]["quarter"], 3)
+            finally:
+                gateway.close()
+
 
 if __name__ == "__main__":
     unittest.main()

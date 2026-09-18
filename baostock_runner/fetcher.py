@@ -129,7 +129,12 @@ class Fetcher:
                 self._sleep(60)
 
     def _step_once(self) -> bool:
-        """执行一个批次的工作；返回是否发生了真实的 BaoStock 请求。"""
+        """执行一个批次的工作；返回是否发生了真实的 BaoStock 请求。
+
+        初始化类任务（证券池/日历/行业/成分）必须短路完成；
+        轮询类任务（日线/财务/分红/复权）逐个尝试，任何一个做了活就返回 True，
+        避免因某类任务暂时无活而短路掉后续阶段（如日线完成后必须继续财务）。
+        """
         if self._need_universe_init():
             return self._fetch_universe_init()
         if self._need_calendar():
@@ -138,14 +143,14 @@ class Fetcher:
             return self._fetch_industry()
         if self._need_index_refresh():
             return self._fetch_index()
-        if self._need_daily_backfill():
-            return self._fetch_daily_batch()
-        if self._need_financial_backfill():
-            return self._fetch_financial_batch()
-        if self.settings.fetch_include_dividends and self._need_dividends():
-            return self._fetch_dividends_batch()
-        if self.settings.fetch_include_adjust_factors and self._need_adjust_factors():
-            return self._fetch_adjust_factors_batch()
+        if self._fetch_daily_batch():
+            return True
+        if self._fetch_financial_batch():
+            return True
+        if self.settings.fetch_include_dividends and self._fetch_dividends_batch():
+            return True
+        if self.settings.fetch_include_adjust_factors and self._fetch_adjust_factors_batch():
+            return True
         return False
 
     # ---------- init: securities pool + base data ----------
@@ -320,7 +325,10 @@ class Fetcher:
                     for ds in datasets:
                         if ds not in FINANCIAL_METHODS:
                             continue
-                        if self.storage.financial_exists(ds, code, year, quarter):
+                        # 已落库或已标记 done（含空报告期，如未发布的季度）都跳过，
+                        # 否则空报告期会在每轮循环里反复查询形成死循环。
+                        if self.storage.financial_exists(ds, code, year, quarter) or \
+                           self.storage.job_status("financials", f"{code}|{year}Q{quarter}|{ds}") == "done":
                             continue
                         self._set_state(current=f"financials: {code} {year}Q{quarter} {ds}",
                                         dataset="financials", done=1, total=1)
