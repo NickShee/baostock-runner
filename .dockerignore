@@ -1,7 +1,16 @@
+.git
+.env
+data
+*.sqlite3
+*.jsonl
+*.bak*
 __pycache__/
 *.py[cod]
 .pytest_cache/
 .venv/
 .git/
-data/
 logs/
+dashboard/node_modules
+dashboard/dist
+baostock_runner/dashboard_dist
+docker-compose*.bak*

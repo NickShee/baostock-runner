@@ -1,3 +1,11 @@
+FROM node:22-alpine AS dashboard-builder
+
+WORKDIR /app/dashboard
+COPY dashboard/package.json dashboard/package-lock.json* ./
+RUN npm ci --no-audit --no-fund
+COPY dashboard/ ./
+RUN npm run build
+
 FROM python:3.12-slim
 
 ARG HTTP_PROXY
@@ -17,6 +25,7 @@ RUN http_proxy="${HTTP_PROXY}" \
     pip install --no-cache-dir -r requirements.txt
 
 COPY baostock_runner ./baostock_runner
+COPY --from=dashboard-builder /app/dashboard/dist ./baostock_runner/dashboard_dist
 COPY README.md .
 
 RUN useradd --create-home --uid 10001 runner \

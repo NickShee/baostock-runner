@@ -8,3 +8,8 @@ __pycache__/
 
 # backup artifacts
 *bak*
+
+# dashboard build artifacts
+dashboard/node_modules/
+dashboard/dist/
+baostock_runner/dashboard_dist/
