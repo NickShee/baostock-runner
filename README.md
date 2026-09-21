@@ -92,12 +92,28 @@ BaoStock 免费长连接在服务端空闲超时或波动时会静默断开。�
 | `BAOSTOCK_RECONNECT_ON_FAILURE` | `true` | 查询失败（非黑名单）且重试耗尽后，重连一次再试 |
 | `BAOSTOCK_VERIFY_AFTER_LOGIN` | `true` | 登录后用 `query_stock_basic` 轻量验证通道真实可用 |
 
+## Worker 心跳看门狗（v0.10.x+）
+
+gateway 单 worker 在 BaoStock 半开连接下可能卡进 `rs.next()` 用户态死循环：
+数据零进展、CPU 空转、queue 中 Job 全部排队，而进程表面仍存活（healthcheck 只探 TCP 端口）。
+内置"心跳自愈 + 查询级防护"双层兜底：
+
+| 环境变量 | 默认值 | 说明 |
+|---|---|---|
+| `BAOSTOCK_WATCHDOG_ENABLED` | `true` | worker 心跳看门狗总开关 |
+| `BAOSTOCK_WATCHDOG_TIMEOUT_SECONDS` | `300` | 心跳停滞超过该秒数即终止进程，由容器 `restart` 策略自动拉起 |
+| `BAOSTOCK_WATCHDOG_CHECK_INTERVAL_SECONDS` | `15` | 看门狗检查间隔（最小 5s） |
+| `BAOSTOCK_MAX_RESULT_ROWS` | `50000` | 单次查询结果集行数上限，防 `rs.next()` 无限累积 |
+
+正常查询（含大数据量遍历）会持续刷新心跳，不会被误杀。
+
 ## 已修复的 Bug（实测驱动）
 
 | # | 现象 | 根因 | 修复 |
 |---|---|---|---|
 | 1 | 日线回填完成后财务阶段永不启动，fetcher 空转 `idle` | `_step_once` 中 `_need_daily_backfill()` 恒真，`return _fetch_daily_batch()` 在日线无活时短路返回，后续财务判断被跳过 | 轮询类任务（日线/财务/分红/复权）逐个尝试、有活即 True；配套回归测试 |
 | 2 | 财务回填对未发布季度（如当年 Q4）**反复查询同一 (code,year,quarter)** 形成死循环 | 空报告期不写 financials 行，`financial_exists` 永不命中；job 虽标 done 但跳过判断不查 job | 跳过判断同时检查 `download_jobs` 状态（已 done 即跳过）；配套回归测试 |
+| 3 | gateway worker 卡进 `while rs.next()` 用户态死循环：CPU 100% 空转、数据零写入、MCP/fetcher 全部排队 | baostock 半开连接下 `rs.next()` 永不返回 False；结果集读取无行数/超时保护 | 行数上限 + 遍历超时双保险 + worker 心跳看门狗（心跳停滞自动重启容器）；配套回归测试 |
 | 3 | `get_daily_pending_codes` 漏掉待补股票 | `LEFT JOIN download_jobs` 无匹配时 `NOT (...)` 求值为 NULL 被 WHERE 过滤（SQL 三值逻辑） | 加 `j.batch_id IS NULL OR` 显式放行 |
 | 4 | fetcher 与 MCP 工具调用 `query_stock_basic` 报参数错误 | 真实签名是 `(code, code_name)`，**无 `status` 参数** | 按真实签名修复调用 |
 | 5 | 财务配置启用 `operation`/`dupont` 时被拒 | `SUPPORTED_METHODS` 缺这两个 dataset | 补入 |
