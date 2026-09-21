@@ -2,6 +2,7 @@ from dataclasses import dataclass
 import hashlib
 import itertools
 import json
+import os
 import queue
 import socket
 import threading
@@ -59,13 +60,24 @@ class BaoStockGateway:
         # 会话保活：记录最后一次成功活动的时间（monotonic），超时则主动重连。
         self.last_activity = time.monotonic()
         self.session_lock = threading.Lock()
+        # worker 心跳：worker 每处理一个 Job（以及大数据量遍历中定期）刷新。
+        # watchdog 线程发现心跳停滞超过阈值即终止进程，由容器 restart 自动拉起。
+        self.last_heartbeat = time.monotonic()
         self.worker = threading.Thread(target=self._worker, name="baostock-single-worker", daemon=True)
         self.worker.start()
+        self.watchdog = None
+        if self.settings.watchdog_enabled:
+            self.watchdog = threading.Thread(
+                target=self._watchdog_loop, name="baostock-watchdog", daemon=True
+            )
+            self.watchdog.start()
 
     def close(self):
         self.stop_event.set()
         self.jobs.put((-1, next(self._seq), None))
         self.worker.join(timeout=10)
+        if self.watchdog is not None:
+            self.watchdog.join(timeout=2)
 
     def call(self, method: str, params: dict[str, Any], use_cache: bool = True, priority: int = 0) -> dict[str, Any]:
         if not self.ready.wait(timeout=15):
@@ -144,6 +156,7 @@ class BaoStockGateway:
                 _, _, job = self.jobs.get()
                 if job is None:
                     break
+                self._beat()
                 try:
                     value = self._execute_robust(bs, job.method, job.params, job.use_cache)
                     job.result.put((True, value))
@@ -162,6 +175,40 @@ class BaoStockGateway:
         finally:
             if logged_in and bs is not None:
                 bs.logout()
+
+    def _beat(self):
+        """刷新 worker 心跳（watchdog 据此判断 worker 是否卡死）。"""
+        self.last_heartbeat = time.monotonic()
+
+    def _watchdog_tick(self) -> bool:
+        """单次看门狗判定：worker 心跳停滞是否超过阈值（True = 应终止进程）。"""
+        timeout = max(30, self.settings.watchdog_timeout_seconds)
+        try:
+            idle = time.monotonic() - self.last_heartbeat
+            if idle > timeout:
+                print(
+                    f"[watchdog] CRITICAL: gateway worker heartbeat stalled for {idle:.0f}s "
+                    f"(> {timeout}s). Killing process to trigger container restart.",
+                    flush=True,
+                )
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _watchdog_loop(self):
+        """worker 心跳看门狗线程：见 _watchdog_tick；停滞时 os._exit(1) 触发容器重启。
+
+        背景：baostock 免费服务在半开连接下可能让 rs.next() 进入用户态死循环，
+        worker 线程被占死，queue 中的 Job 全部排队无人处理（fetcher/MCP 同时阻塞），
+        而进程表面仍存活（uvicorn 正常响应健康检查），实际数据零进展、CPU 空转。
+        此时唯一可靠的自愈路径是终止进程，让 restart: unless-stopped 拉起重来。
+        """
+        interval = max(5, self.settings.watchdog_check_interval_seconds)
+        while not self.stop_event.is_set():
+            if self._watchdog_tick():
+                os._exit(1)
+            self.stop_event.wait(interval)
 
     def _session_fresh(self) -> bool:
         """距上一次成功活动是否仍在会话空闲超时阈值内。"""
@@ -240,8 +287,23 @@ class BaoStockGateway:
                 time.sleep(delay)
             self.last_activity = time.monotonic()
             rows = []
+            loop_started = time.monotonic()
             while rs.next():
                 rows.append(dict(zip(rs.fields, rs.get_row_data())))
+                # 死循环防护：baostock 半开连接下 rs.next() 可能永远返回 True。
+                # 行数上限 + 遍历超时双保险，避免 worker 被占死（CPU 空转、Job 排队）。
+                if len(rows) > self.settings.max_result_rows:
+                    raise RuntimeError(
+                        f"BaoStock result set exceeded {self.settings.max_result_rows} rows; "
+                        "aborting to prevent rs.next() dead-loop"
+                    )
+                if time.monotonic() - loop_started > self.settings.watchdog_timeout_seconds:
+                    raise ReconnectableFailure(
+                        "BaoStock rs.next() stalled (result set read timed out); "
+                        "connection likely half-open"
+                    )
+                if len(rows) % 100 == 0:
+                    self._beat()
             count = self.storage.increment_usage()
         payload = {"data": rows, "cache_hit": False, "request_count_today": count}
         if use_cache:

@@ -1,11 +1,12 @@
 import os
 import sys
 import tempfile
+import time
 import types
 import unittest
 
 from baostock_runner.config import Settings
-from baostock_runner.gateway import BaoStockGateway
+from baostock_runner.gateway import BaoStockGateway, ReconnectableFailure
 
 
 class _FakeResult:
@@ -198,6 +199,127 @@ class GatewayTest(unittest.TestCase):
                 self.assertFalse(result["cache_hit"])
                 self.assertEqual(fake.login_count, 2)  # 启动 1 + 失败重连 1
                 self.assertGreaterEqual(fake.logout_count, 1)
+            finally:
+                gateway.close()
+
+
+    # ---------- dead-loop guards & worker watchdog ----------
+
+    def test_result_set_row_cap_breaks_dead_loop(self):
+        class _InfiniteResult:
+            error_code = "0"
+            error_msg = ""
+            fields = ["date", "code", "close"]
+
+            def next(self):
+                return True  # never ends -> simulated rs.next() dead loop
+
+            def get_row_data(self):
+                return ["2026-09-15", "sh.600000", "10.0"]
+
+        class _InfiniteBS:
+            def login(self, user_id="", password=""):
+                return _FakeResult()
+
+            def logout(self):
+                pass
+
+            def is_login(self):
+                return True
+
+            def query_stock_basic(self, code=""):
+                return _FakeResult()
+
+            def query_history_k_data_plus(self, **params):
+                return _InfiniteResult()
+
+        self._install_fake_baostock(_InfiniteBS())
+        with tempfile.TemporaryDirectory() as directory:
+            settings = Settings(
+                db_path=os.path.join(directory, "data.sqlite3"),
+                log_path=os.path.join(directory, "audit.jsonl"),
+                min_interval_seconds=0,
+                daily_hard_limit=1000,
+                max_result_rows=200,
+                watchdog_timeout_seconds=60,
+                watchdog_enabled=False,
+                offline=False,
+            )
+            gateway = BaoStockGateway(settings)
+            try:
+                with self.assertRaisesRegex(RuntimeError, "result set exceeded"):
+                    gateway.call("query_history_k_data_plus", {"code": "sh.600000", "start_date": "2026-09-15", "end_date": "2026-09-16"})
+                # 死在 increment_usage 之前：usage 不应被计入
+                self.assertEqual(gateway.storage.usage_today(), 0)
+            finally:
+                gateway.close()
+
+    def test_result_set_timeout_breaks_dead_loop(self):
+        class _SlowInfiniteResult:
+            error_code = "0"
+            error_msg = ""
+            fields = ["date", "code", "close"]
+
+            def next(self):
+                time.sleep(0.02)  # 每行消耗一点真实时间，触发遍历超时
+                return True
+
+            def get_row_data(self):
+                return ["2026-09-15", "sh.600000", "10.0"]
+
+        class _SlowBS:
+            def login(self, user_id="", password=""):
+                return _FakeResult()
+
+            def logout(self):
+                pass
+
+            def is_login(self):
+                return True
+
+            def query_stock_basic(self, code=""):
+                return _FakeResult()
+
+            def query_history_k_data_plus(self, **params):
+                return _SlowInfiniteResult()
+
+        self._install_fake_baostock(_SlowBS())
+        with tempfile.TemporaryDirectory() as directory:
+            settings = Settings(
+                db_path=os.path.join(directory, "data.sqlite3"),
+                log_path=os.path.join(directory, "audit.jsonl"),
+                min_interval_seconds=0,
+                daily_hard_limit=1000,
+                max_result_rows=100000,  # 行数上限放宽，由遍历超时兜底
+                watchdog_timeout_seconds=1,
+                max_retries=0,
+                retry_delays=(),
+                reconnect_on_failure=False,
+                watchdog_enabled=False,
+                offline=False,
+            )
+            gateway = BaoStockGateway(settings)
+            try:
+                with self.assertRaises(ReconnectableFailure):
+                    gateway.call("query_history_k_data_plus", {"code": "sh.600000", "start_date": "2026-09-15", "end_date": "2026-09-16"})
+            finally:
+                gateway.close()
+
+    def test_watchdog_tick_detects_stall(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings = Settings(
+                db_path=os.path.join(directory, "data.sqlite3"),
+                log_path=os.path.join(directory, "audit.jsonl"),
+                min_interval_seconds=0,
+                watchdog_timeout_seconds=30,
+                watchdog_enabled=False,
+                offline=True,
+            )
+            gateway = BaoStockGateway(settings)
+            try:
+                self.assertFalse(gateway._watchdog_tick())
+                gateway.last_heartbeat = time.monotonic() - 999
+                self.assertTrue(gateway._watchdog_tick())
             finally:
                 gateway.close()
 

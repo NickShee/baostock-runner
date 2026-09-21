@@ -63,3 +63,12 @@ class Settings:
     fetch_idle_sleep_seconds: int = _int("BAOSTOCK_FETCH_IDLE_SLEEP_SECONDS", 300)
     # 预算耗尽后的暂停检查间隔（秒）；按天计数，跨天自动恢复。
     fetch_pause_sleep_seconds: int = _int("BAOSTOCK_FETCH_PAUSE_SLEEP_SECONDS", 600)
+    # --- worker heartbeat / watchdog ---
+    # gateway worker 心跳看门狗：worker 卡死（如 baostock rs.next() 在半开连接下死循环）
+    # 且心跳停滞超过阈值时，主动终止进程，由容器 restart 策略自动拉起。
+    # 正常查询（含大数据量遍历）会持续刷新心跳，不会误杀。
+    watchdog_enabled: bool = os.getenv("BAOSTOCK_WATCHDOG_ENABLED", "true").lower() == "true"
+    watchdog_timeout_seconds: int = _int("BAOSTOCK_WATCHDOG_TIMEOUT_SECONDS", 300)
+    watchdog_check_interval_seconds: int = _int("BAOSTOCK_WATCHDOG_CHECK_INTERVAL_SECONDS", 15)
+    # 单次 baostock 查询结果集行数上限：rs.next() 死循环时强制中止，防止无限累积。
+    max_result_rows: int = _int("BAOSTOCK_MAX_RESULT_ROWS", 50000)
