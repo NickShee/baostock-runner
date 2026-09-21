@@ -49,10 +49,19 @@ services:
       BAOSTOCK_FETCH_INCLUDE_ADJUST_FACTORS: ${BAOSTOCK_FETCH_INCLUDE_ADJUST_FACTORS:-false}
       BAOSTOCK_FETCH_IDLE_SLEEP_SECONDS: ${BAOSTOCK_FETCH_IDLE_SLEEP_SECONDS:-300}
       BAOSTOCK_FETCH_PAUSE_SLEEP_SECONDS: ${BAOSTOCK_FETCH_PAUSE_SLEEP_SECONDS:-600}
+      # Worker heartbeat watchdog: self-heal when the gateway worker dead-loops
+      # (baostock rs.next() half-open spin) - kill the process so the container
+      # restart policy recreates it. Normal queries refresh the heartbeat.
+      BAOSTOCK_WATCHDOG_ENABLED: ${BAOSTOCK_WATCHDOG_ENABLED:-true}
+      BAOSTOCK_WATCHDOG_TIMEOUT_SECONDS: ${BAOSTOCK_WATCHDOG_TIMEOUT_SECONDS:-300}
+      BAOSTOCK_WATCHDOG_CHECK_INTERVAL_SECONDS: ${BAOSTOCK_WATCHDOG_CHECK_INTERVAL_SECONDS:-15}
+      BAOSTOCK_MAX_RESULT_ROWS: ${BAOSTOCK_MAX_RESULT_ROWS:-50000}
+      # Offline mode: no network/credentials needed (dev / MCP line testing)
+      BAOSTOCK_OFFLINE: ${BAOSTOCK_OFFLINE:-false}
     healthcheck:
       test: ["CMD", "python", "-c", "import socket; s=socket.create_connection(('127.0.0.1', 8000), 3); s.close()"]
-      interval: 30s
-      timeout: 5s
+      interval: 300s
+      timeout: 10s
       retries: 3
       start_period: 20s
 networks:
