@@ -63,6 +63,9 @@ class BaoStockGateway:
         # worker 心跳：worker 每处理一个 Job（以及大数据量遍历中定期）刷新。
         # watchdog 线程发现心跳停滞超过阈值即终止进程，由容器 restart 自动拉起。
         self.last_heartbeat = time.monotonic()
+        # 忙碌标志：仅当 worker 正在执行 Job 时才认为"应当在刷新心跳"。
+        # 空闲（队列为空）是正常状态而非卡死，否则 watchdog 会周期性误杀空闲进程。
+        self._busy = False
         self.worker = threading.Thread(target=self._worker, name="baostock-single-worker", daemon=True)
         self.worker.start()
         self.watchdog = None
@@ -156,12 +159,15 @@ class BaoStockGateway:
                 _, _, job = self.jobs.get()
                 if job is None:
                     break
+                self._busy = True
                 self._beat()
                 try:
                     value = self._execute_robust(bs, job.method, job.params, job.use_cache)
                     job.result.put((True, value))
                 except Exception as exc:
                     job.result.put((False, exc))
+                finally:
+                    self._busy = False
         except Exception as exc:
             self.startup_error = exc
             self.ready.set()
@@ -184,6 +190,9 @@ class BaoStockGateway:
         """单次看门狗判定：worker 心跳停滞是否超过阈值（True = 应终止进程）。"""
         timeout = max(30, self.settings.watchdog_timeout_seconds)
         try:
+            if not self._busy:
+                # worker 空闲等待 Job，心跳本来就不刷新，属正常状态。
+                return False
             idle = time.monotonic() - self.last_heartbeat
             if idle > timeout:
                 print(
