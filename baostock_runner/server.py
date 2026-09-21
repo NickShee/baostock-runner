@@ -3,7 +3,6 @@ import re
 from mcp.server.fastmcp import FastMCP
 
 from .config import Settings
-from .dashboard_api import register_dashboard_routes
 from .fetcher import Fetcher
 from .gateway import BaoStockGateway
 
@@ -20,7 +19,6 @@ gateway = BaoStockGateway(settings)
 fetcher = Fetcher(gateway, settings)
 atexit.register(gateway.close)
 atexit.register(fetcher.stop)
-register_dashboard_routes(mcp, gateway, fetcher, settings)
 
 
 @mcp.tool()
