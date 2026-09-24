@@ -63,6 +63,12 @@ class Settings:
     fetch_idle_sleep_seconds: int = _int("BAOSTOCK_FETCH_IDLE_SLEEP_SECONDS", 300)
     # 预算耗尽后的暂停检查间隔（秒）；按天计数，跨天自动恢复。
     fetch_pause_sleep_seconds: int = _int("BAOSTOCK_FETCH_PAUSE_SLEEP_SECONDS", 600)
+    # --- A-01: 统一时间与日历推进 ---
+    # 业务日/预算计数统一按 Asia/Shanghai 划日；审计时间统一保存 UTC（见 timeutil.Clock）。
+    # 日线当日检查默认从上海时间 18:00 开始（仅表示"开始尝试"），HH:MM 格式，可配置。
+    daily_check_time: str = os.getenv("BAOSTOCK_DAILY_CHECK_TIME", "18:00")
+    # 交易日历预拉窗口（天）：上游若支持未来日历可预拉一个窗口；0 = 不假设未来日期必得。
+    calendar_prelook_days: int = _int("BAOSTOCK_CALENDAR_PRELOOK_DAYS", 0)
     # --- worker heartbeat / watchdog ---
     # gateway worker 心跳看门狗：worker 卡死（如 baostock rs.next() 在半开连接下死循环）
     # 且心跳停滞超过阈值时，主动终止进程，由容器 restart 策略自动拉起。

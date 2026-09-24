@@ -154,8 +154,7 @@ def get_latest_stock_snapshot(codes: list[str], adjust: str = "none") -> dict:
         if not re.fullmatch(r"(?:sh|sz|bj)\.\d{6}", code):
             raise ValueError(f"invalid stock code: {code}")
     # The date range is deliberately bounded; the Gateway still serializes every call.
-    import datetime
-    today = datetime.date.today().isoformat()
+    today = gateway.clock.business_date().isoformat()
     results = []
     for code in codes:
         result = get_stock_daily_bars(code, today, today, adjust)

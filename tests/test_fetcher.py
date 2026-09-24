@@ -1,3 +1,4 @@
+import datetime
 import os
 import tempfile
 import threading
@@ -8,6 +9,7 @@ from baostock_runner.config import Settings
 from baostock_runner.fetcher import Fetcher, BudgetExhausted
 from baostock_runner.gateway import BaoStockGateway
 from baostock_runner.storage import Storage
+from baostock_runner.timeutil import Clock
 
 
 def _settings(directory, **kw):
@@ -17,6 +19,26 @@ def _settings(directory, **kw):
     )
     base.update(kw)
     return Settings(**base)
+
+
+def _fixed_clock() -> Clock:
+    """A-01: 固定业务日（上海 2026-09-24 周四 18:30，已过当日检查时间 18:00）。
+    避免测试依赖真实当前年份/日期（ENV-01 特别要求：可注入时钟）。"""
+    fixed = datetime.datetime(2026, 9, 24, 18, 30,
+                              tzinfo=datetime.timezone(datetime.timedelta(hours=8)))
+    return Clock(now_fn=lambda: fixed)
+
+
+def _ready_storage(storage, fetcher):
+    """A-01: 让调度前置条件就绪（写真实日历覆盖到今天），避免被日历补齐短路。"""
+    storage.put_securities([{"code": "sh.600000", "name": "浦发", "status": "1"}])
+    storage.set_meta("stock_industry", detail="ready")
+    storage.set_meta("index_constituents", detail="ready")
+    today = fetcher.business_today
+    storage.put_trade_calendar([
+        {"calendar_date": today, "is_trading_day": 1},
+        {"calendar_date": "2099-01-01", "is_trading_day": 1},
+    ])
 
 
 class StorageFetchSchemaTest(unittest.TestCase):
@@ -173,15 +195,11 @@ class FetcherBudgetTest(unittest.TestCase):
             settings = _settings(d, min_interval_seconds=0, daily_hard_limit=100,
                                  fetch_budget_ratio=0.5, offline=True,
                                  fetch_financial_start_year=2025)
-            gateway = BaoStockGateway(settings)
+            gateway = BaoStockGateway(settings, clock=_fixed_clock())
             fetcher = Fetcher(gateway, settings)
             try:
                 storage = gateway.storage
-                # 基础数据就绪（跳过 init 阶段）
-                storage.put_securities([{"code": "sh.600000", "name": "浦发", "status": "1"}])
-                storage.set_meta("trade_calendar", detail="ready")
-                storage.set_meta("stock_industry", detail="ready")
-                storage.set_meta("index_constituents", detail="ready")
+                _ready_storage(storage, fetcher)
                 # 日线"已到最新"：写入未来日期 bar，确保 pending 为空
                 storage.put_daily_bars("sh.600000", "d", "3",
                                        [{"date": "2099-01-01", "code": "sh.600000", "close": "10"}])
@@ -197,14 +215,11 @@ class FetcherBudgetTest(unittest.TestCase):
             settings = _settings(d, min_interval_seconds=0, daily_hard_limit=100,
                                  fetch_budget_ratio=0.5, offline=True,
                                  fetch_financial_start_year=2026)
-            gateway = BaoStockGateway(settings)
+            gateway = BaoStockGateway(settings, clock=_fixed_clock())
             fetcher = Fetcher(gateway, settings)
             try:
                 storage = gateway.storage
-                storage.put_securities([{"code": "sh.600000", "name": "浦发", "status": "1"}])
-                storage.set_meta("trade_calendar", detail="ready")
-                storage.set_meta("stock_industry", detail="ready")
-                storage.set_meta("index_constituents", detail="ready")
+                _ready_storage(storage, fetcher)
                 storage.put_daily_bars("sh.600000", "d", "3",
                                        [{"date": "2099-01-01", "code": "sh.600000", "close": "10"}])
                 # 模拟空报告期已 done（financials 表无行）

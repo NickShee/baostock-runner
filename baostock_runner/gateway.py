@@ -11,6 +11,7 @@ from typing import Any
 
 from .config import Settings
 from .storage import Storage
+from .timeutil import Clock
 
 
 BLACKLIST_CODE = "10001011"
@@ -46,9 +47,12 @@ class Job:
 
 class BaoStockGateway:
     """All BaoStock calls happen in this one worker thread and one session."""
-    def __init__(self, settings: Settings | None = None):
+    def __init__(self, settings: Settings | None = None, clock: Clock | None = None):
         self.settings = settings or Settings()
-        self.storage = Storage(self.settings.db_path, self.settings.log_path)
+        # A-01: 可注入时钟（业务日 Asia/Shanghai、审计 UTC），传给 Storage/Fetcher。
+        # 测试可传假时钟推进日期/预算日；默认使用真实时钟。
+        self.clock: Clock = clock or Clock()
+        self.storage = Storage(self.settings.db_path, self.settings.log_path, clock=self.clock)
         # 优先级队列：MCP 查询（priority=0）总排到 fetcher（priority=1）前面；
         # 同优先级用递增序号保证 FIFO，不比较 Job 对象本身。
         self.jobs: queue.PriorityQueue = queue.PriorityQueue()
@@ -249,7 +253,7 @@ class BaoStockGateway:
 
     def _execute_robust(self, bs, method: str, p: dict[str, Any], use_cache: bool = True):
         """健壮执行路径：先保证会话新鲜，失败后视类型重连一轮再试。"""
-        if self.storage.usage_today() >= self.settings.daily_hard_limit:
+        if self.storage.usage_today_conservative() >= self.settings.daily_hard_limit:
             raise RuntimeError("Daily BaoStock request hard limit reached")
         if self.settings.offline:
             return self._execute(bs, method, p, use_cache)
@@ -269,7 +273,7 @@ class BaoStockGateway:
             return self._execute(bs, method, p, use_cache)
 
     def _execute(self, bs, method: str, p: dict[str, Any], use_cache: bool = True):
-        if self.storage.usage_today() >= self.settings.daily_hard_limit:
+        if self.storage.usage_today_conservative() >= self.settings.daily_hard_limit:
             raise RuntimeError("Daily BaoStock request hard limit reached")
         if self.settings.offline:
             fields = [field.strip() for field in p.get("fields", "date,code").split(",")]

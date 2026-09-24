@@ -305,7 +305,9 @@ class GatewayTest(unittest.TestCase):
             finally:
                 gateway.close()
 
-    def test_watchdog_tick_detects_stall(self):
+    def test_watchdog_idle_worker_not_killed(self):
+        """空闲不误杀：worker 未在执行 Job（_busy=False）时，即使心跳陈旧
+        （正常空闲不刷新心跳），_watchdog_tick 必须返回 False。"""
         with tempfile.TemporaryDirectory() as directory:
             settings = Settings(
                 db_path=os.path.join(directory, "data.sqlite3"),
@@ -317,9 +319,36 @@ class GatewayTest(unittest.TestCase):
             )
             gateway = BaoStockGateway(settings)
             try:
+                # 初始状态：worker 空闲（queue 为空），不应判定为卡死
+                self.assertFalse(gateway._busy)
                 self.assertFalse(gateway._watchdog_tick())
+                # 即使把心跳人为拨到很久以前，空闲状态仍然不是卡死
+                gateway.last_heartbeat = time.monotonic() - 999
+                self.assertFalse(gateway._watchdog_tick())
+            finally:
+                gateway.close()
+
+    def test_watchdog_busy_stall_detected(self):
+        """忙碌停滞触发：worker 正在执行 Job（_busy=True）且心跳停滞超过阈值时，
+        _watchdog_tick 必须返回 True（应终止进程由容器重启）。"""
+        with tempfile.TemporaryDirectory() as directory:
+            settings = Settings(
+                db_path=os.path.join(directory, "data.sqlite3"),
+                log_path=os.path.join(directory, "audit.jsonl"),
+                min_interval_seconds=0,
+                watchdog_timeout_seconds=30,
+                watchdog_enabled=False,
+                offline=True,
+            )
+            gateway = BaoStockGateway(settings)
+            try:
+                # 模拟 worker 正在执行：心跳很久未刷新，应触发
+                gateway._busy = True
                 gateway.last_heartbeat = time.monotonic() - 999
                 self.assertTrue(gateway._watchdog_tick())
+                # 心跳新鲜：忙碌但正常推进，不应误杀
+                gateway.last_heartbeat = time.monotonic()
+                self.assertFalse(gateway._watchdog_tick())
             finally:
                 gateway.close()
 

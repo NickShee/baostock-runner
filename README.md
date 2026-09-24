@@ -163,7 +163,17 @@ get_backfill_status    # fetcher 状态、预算拆分、任务统计
 get_market_coverage    # 各表行数与新鲜度
 ```
 
-单测：`docker exec baostock-runner python -m unittest discover -s /app/tests_p1 -v`（18+ 用例）。
+单测（Python 3.12 隔离环境，强制 offline，不登录真实 BaoStock、不访问生产库）：
+
+```bash
+scripts/run_tests.sh        # Docker python:3.12 隔离容器（推荐，与生产基镜像一致）
+scripts/run_tests.sh -l     # 本机 Python 3.11+（需已安装依赖；测试强制 BAOSTOCK_OFFLINE=true）
+# 等价于：python -m unittest discover -s tests -v
+```
+
+测试入口与生产入口严格区分：生产启动为 `python -m baostock_runner`（或 `docker compose up`）；
+测试入口 `scripts/run_tests.sh` 固定强制 `BAOSTOCK_OFFLINE=true`，防止误连真实服务。
+依赖精确版本见 `requirements.lock`（由 `scripts/generate_lock.sh` 在 python:3.12-slim 中生成）。
 
 ## 可用 MCP 工具
 

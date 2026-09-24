@@ -1,0 +1,19 @@
+# ENV-01: 可复现的 Python 3.12 隔离测试环境
+# 与生产 Dockerfile 同基镜像(python:3.12-slim)，安装锁定依赖后仅保留代码+测试。
+# 用法:
+#   docker build -f Dockerfile.test-env -t baostock-runner-test:env .
+#   docker run --rm baostock-runner-test:env          # 跑全部单元测试
+# 测试全部 offline（不登录 BaoStock、不访问生产数据库）。
+FROM python:3.12-slim
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+WORKDIR /app
+# 优先使用精确锁定文件；缺失时退回 requirements.txt 范围约束
+COPY requirements.txt requirements.lock* ./
+RUN if [ -f requirements.lock ]; then \
+      pip install --no-cache-dir -r requirements.lock; \
+    else \
+      pip install --no-cache-dir -r requirements.txt; \
+    fi
+COPY baostock_runner ./baostock_runner
+COPY tests ./tests
+CMD ["python", "-m", "unittest", "discover", "-s", "tests", "-v"]

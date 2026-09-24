@@ -20,6 +20,7 @@ from typing import Any
 
 from .config import Settings
 from .gateway import BaoStockGateway
+from .timeutil import Clock, parse_check_time
 
 
 class BudgetExhausted(Exception):
@@ -47,6 +48,8 @@ class Fetcher:
         self.gateway = gateway
         self.settings = settings or gateway.settings
         self.storage = gateway.storage
+        # A-01: 统一时间。业务日/预算按 Asia/Shanghai；审计时间 UTC。
+        self.clock: Clock = gateway.clock
         self.stop_event = threading.Event()
         self.wake_event = threading.Event()
         self._state_lock = threading.Lock()
@@ -60,6 +63,13 @@ class Fetcher:
             "updated_at": "",
         }
         self.thread = threading.Thread(target=self._run, name="baostock-fetcher", daemon=True)
+
+    # ---------- A-01: 业务日/时间辅助 ----------
+
+    @property
+    def business_today(self) -> str:
+        """当前上海业务日（YYYY-MM-DD）。"""
+        return self.clock.business_date().isoformat()
 
     # ---------- lifecycle ----------
 
@@ -84,7 +94,7 @@ class Fetcher:
             return dict(self._state)
 
     def _set_state(self, **kw):
-        kw.setdefault("updated_at", datetime.datetime.now(datetime.timezone.utc).isoformat())
+        kw.setdefault("updated_at", self.clock.now_utc().isoformat())
         with self._state_lock:
             self._state.update(kw)
 
@@ -167,7 +177,7 @@ class Fetcher:
         constituents = res["data"]
         if not constituents:
             raise RuntimeError("query_hs300_stocks returned no constituents")
-        today = datetime.date.today().isoformat()
+        today = self.business_today
         self.storage.put_index_constituents("hs300", today, constituents)
         codes = [r["code"] for r in constituents]
         basic_res = self._bounded_call("query_stock_basic", {"code": "", "code_name": ""})
@@ -190,16 +200,27 @@ class Fetcher:
         return True
 
     def _need_calendar(self) -> bool:
-        meta = self.storage.get_meta("trade_calendar")
-        if meta is None:
+        """A-01: 按覆盖终点触发补齐。
+
+        目标终点 = 上海业务日 + 可配置预拉窗口（默认 0 = 不假设未来）。
+        本地日历最大日期 < 目标终点即触发补齐；不依赖 meta 月份判断。
+        """
+        max_date = self.storage.calendar_max_date()
+        if max_date is None:
             return True
-        # 每月刷新一次（拉到今天）
-        last = meta.get("last_updated", "")
-        return not last.startswith(datetime.date.today().strftime("%Y-%m"))
+        target = self._calendar_target_end()
+        return max_date < target
+
+    def _calendar_target_end(self) -> str:
+        """日历补齐目标终点：上海业务日 + prelook 窗口。"""
+        end = datetime.date.fromisoformat(self.business_today)
+        if self.settings.calendar_prelook_days > 0:
+            end += datetime.timedelta(days=self.settings.calendar_prelook_days)
+        return end.isoformat()
 
     def _fetch_calendar(self) -> bool:
         start = self.settings.fetch_daily_start_date
-        end = datetime.date.today().isoformat()
+        end = self._calendar_target_end()
         self._set_state(current="init: fetching trade calendar")
         res = self._bounded_call("query_trade_dates", {"start_date": start, "end_date": end})
         rows = [
@@ -218,7 +239,7 @@ class Fetcher:
         last = meta.get("last_updated", "")
         try:
             d = datetime.date.fromisoformat(last[:10])
-            return (datetime.date.today() - d).days >= 7
+            return (datetime.date.fromisoformat(self.business_today) - d).days >= 7
         except ValueError:
             return True
 
@@ -244,11 +265,11 @@ class Fetcher:
         meta = self.storage.get_meta("index_constituents")
         if meta is None:
             return True
-        return not meta.get("last_updated", "").startswith(datetime.date.today().isoformat())
+        return not meta.get("last_updated", "").startswith(self.business_today)
 
     def _fetch_index(self) -> bool:
         self._set_state(current="refreshing index constituents")
-        today = datetime.date.today().isoformat()
+        today = self.business_today
         for index_code, method in (
             ("hs300", "query_hs300_stocks"),
             ("sz50", "query_sz50_stocks"),
@@ -264,8 +285,21 @@ class Fetcher:
     # ---------- daily bars backfill (分批) ----------
 
     def _latest_trade_date(self) -> str:
-        today = datetime.date.today().isoformat()
-        return self.storage.latest_trade_date(today) or today
+        """A-01: 目标交易日。
+
+        - 当日检查默认从上海时间 daily_check_time（默认 18:00）开始，仅代表"开始尝试"。
+        - 盘前/盘中（早于检查时间）以最近已结束交易日为目标，不把今天当作已完成。
+        - 空结果不代表当天完成（由覆盖检查/任务状态在 A-02/A-03 负责）。
+        """
+        now_sh = self.clock.now_shanghai()
+        today = now_sh.date()
+        check = parse_check_time(self.settings.daily_check_time)
+        if now_sh.time() >= check and self.storage.is_trading_day(today.isoformat()):
+            # 已过检查时间且今天是交易日：目标 = 今天（开始尝试）
+            return today.isoformat()
+        # 否则以最近已结束交易日为目标：严格早于今天（今天尚未结束/不是交易日）
+        yesterday = (today - datetime.timedelta(days=1)).isoformat()
+        return self.storage.latest_trade_date(yesterday) or yesterday
 
     def _need_daily_backfill(self) -> bool:
         return self.storage.count_securities() > 0
@@ -316,7 +350,7 @@ class Fetcher:
         if not codes:
             return False
         datasets = [x.strip() for x in self.settings.fetch_financial_datasets.split(",") if x.strip()] or ["profit"]
-        current_year = datetime.date.today().year
+        current_year = self.clock.business_date().year
         for code in codes:
             if self.budget_left() <= 0:
                 raise BudgetExhausted()
@@ -369,7 +403,7 @@ class Fetcher:
             res = self._bounded_call("query_adjust_factor", {
                 "code": code,
                 "start_date": self.settings.fetch_daily_start_date,
-                "end_date": datetime.date.today().isoformat(),
+                "end_date": self.business_today,
             })
             rows = [r for r in res["data"] if r.get("date")]
             self.storage.put_adjust_factors(code, rows)
