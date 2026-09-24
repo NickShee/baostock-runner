@@ -69,6 +69,18 @@ class Settings:
     daily_check_time: str = os.getenv("BAOSTOCK_DAILY_CHECK_TIME", "18:00")
     # 交易日历预拉窗口（天）：上游若支持未来日历可预拉一个窗口；0 = 不假设未来日期必得。
     calendar_prelook_days: int = _int("BAOSTOCK_CALENDAR_PRELOOK_DAYS", 0)
+    # --- A-03: 可重查任务与财务修订 ---
+    # 空财报（waiting_data）到期重查间隔（小时）。
+    financial_waiting_retry_hours: int = _int("BAOSTOCK_FINANCIAL_WAITING_RETRY_HOURS", 24)
+    # 最近两个已结束季度每日检查一次修订（天）。
+    financial_revision_check_days: int = _int("BAOSTOCK_FINANCIAL_REVISION_CHECK_DAYS", 1)
+    # 其余已完成报告每 30 天检查一次修订（天）。
+    financial_revision_check_days_full: int = _int("BAOSTOCK_FINANCIAL_REVISION_CHECK_DAYS_FULL", 30)
+    # 任务租约到期时间（秒）：running 任务超时未完成视为僵死，重启/调度回收。
+    task_lease_seconds: int = _int("BAOSTOCK_TASK_LEASE_SECONDS", 600)
+    # 网络失败指数退避：起始秒、最大秒。
+    task_retry_base_seconds: int = _int("BAOSTOCK_TASK_RETRY_BASE_SECONDS", 60)
+    task_retry_max_seconds: int = _int("BAOSTOCK_TASK_RETRY_MAX_SECONDS", 3600)
     # --- worker heartbeat / watchdog ---
     # gateway worker 心跳看门狗：worker 卡死（如 baostock rs.next() 在半开连接下死循环）
     # 且心跳停滞超过阈值时，主动终止进程，由容器 restart 策略自动拉起。

@@ -30,7 +30,11 @@ def _fixed_clock() -> Clock:
 
 
 def _ready_storage(storage, fetcher):
-    """A-01: 让调度前置条件就绪（写真实日历覆盖到今天），避免被日历补齐短路。"""
+    """A-01: 让调度前置条件就绪（写真实日历覆盖到今天），避免被日历补齐短路。
+
+    同时写入今天与 2099 的日线 bar，使日线"已追平到最新"（缺口检查无活），
+    从而让 _step_once 可以进入财务阶段测试。
+    """
     storage.put_securities([{"code": "sh.600000", "name": "浦发", "status": "1"}])
     storage.set_meta("stock_industry", detail="ready")
     storage.set_meta("index_constituents", detail="ready")
@@ -38,6 +42,10 @@ def _ready_storage(storage, fetcher):
     storage.put_trade_calendar([
         {"calendar_date": today, "is_trading_day": 1},
         {"calendar_date": "2099-01-01", "is_trading_day": 1},
+    ])
+    storage.put_daily_bars("sh.600000", "d", "3", [
+        {"date": today, "code": "sh.600000", "close": "10"},
+        {"date": "2099-01-01", "code": "sh.600000", "close": "10"},
     ])
 
 
@@ -96,19 +104,21 @@ class StorageFetchSchemaTest(unittest.TestCase):
             # 600000 已有数据但未到 09-16；000001 无数据 → 都在 pending
             self.assertEqual(set(pending), {"sh.600000", "sz.000001"})
             # 模拟今天已 done → 当日去重，不再返回
-            storage.job_upsert("daily_bars", "sh.600000|3", "done")
-            storage.job_upsert("daily_bars", "sz.000001|3", "done")
+            storage.job_upsert("daily_bars", "sh.600000|3", "succeeded")
+            storage.job_upsert("daily_bars", "sz.000001|3", "succeeded")
             pending2 = storage.get_daily_pending_codes(limit=10, end_date="2026-09-16", primary_adjustflag="3")
             self.assertEqual(pending2, [])
 
     def test_job_stats(self):
         with tempfile.TemporaryDirectory() as d:
             storage = Storage(db_path=os.path.join(d, "data.sqlite3"), log_path=os.path.join(d, "audit.jsonl"))
-            storage.job_upsert("daily_bars", "a|3", "done")
-            storage.job_upsert("daily_bars", "b|3", "failed", error="boom")
+            storage.job_upsert("daily_bars", "a|3", "succeeded")
+            storage.job_upsert("daily_bars", "b|3", "retryable_failed", error="boom")
             stats = storage.job_stats("daily_bars")
-            self.assertEqual(stats["done"], 1)
-            self.assertEqual(stats["failed"], 1)
+            self.assertEqual(stats["succeeded"], 1)
+            self.assertEqual(stats["done"], 1)  # 向后兼容别名
+            self.assertEqual(stats["retryable_failed"], 1)
+            self.assertEqual(stats["total"], 2)
 
 
 class GatewayUseCacheTest(unittest.TestCase):
@@ -210,7 +220,7 @@ class FetcherBudgetTest(unittest.TestCase):
                 gateway.close()
 
     def test_financial_empty_period_skipped_after_done(self):
-        """回归：空报告期（未发布季度）标记 done 后不得反复查询（防死循环）。"""
+        """回归：空报告期标记 waiting_data 后未到期不得反复查询（防死循环）。"""
         with tempfile.TemporaryDirectory() as d:
             settings = _settings(d, min_interval_seconds=0, daily_hard_limit=100,
                                  fetch_budget_ratio=0.5, offline=True,
@@ -220,15 +230,25 @@ class FetcherBudgetTest(unittest.TestCase):
             try:
                 storage = gateway.storage
                 _ready_storage(storage, fetcher)
-                storage.put_daily_bars("sh.600000", "d", "3",
-                                       [{"date": "2099-01-01", "code": "sh.600000", "close": "10"}])
-                # 模拟空报告期已 done（financials 表无行）
-                storage.job_upsert("financials", "sh.600000|2026Q4|profit", "done")
+                # 固定时钟 2026-09-24：已结束季度 = 2026Q2；
+                # 未来未结束季度（Q3/Q4）不入队，首个入队任务为 2026Q2。
                 worked = fetcher._step_once()
                 self.assertTrue(worked)
-                # Q4 已 done 被跳过，查询应落在 2026Q3
                 rows = storage.get_financials("profit", "sh.600000")
-                self.assertEqual(rows[0]["quarter"], 3)
+                self.assertEqual(rows[0]["quarter"], 2)
+                # 空财报后续轮询：等待期未到不再重复查询（_financial_job_due 直接判定）
+                storage.job_upsert("financials", "sh.600000|2026Q2|profit",
+                                   storage.JOB_WAITING_DATA,
+                                   next_retry_at="2099-01-01T00:00:00+00:00")
+                due, _reason = fetcher._financial_job_due("profit", "sh.600000", 2026, 2)
+                self.assertFalse(due)  # waiting_data 未到期不重查（防死循环）
+                # 空财报等待到期后重新查询
+                now = storage.clock.now_utc().isoformat()
+                storage.job_upsert("financials", "sh.600000|2026Q2|profit",
+                                   storage.JOB_WAITING_DATA,
+                                   next_retry_at="2020-01-01T00:00:00+00:00")
+                due2, _r2 = fetcher._financial_job_due("profit", "sh.600000", 2026, 2)
+                self.assertTrue(due2)
             finally:
                 gateway.close()
 

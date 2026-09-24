@@ -7,10 +7,20 @@ from typing import Any, Callable
 
 from .timeutil import Clock
 
-# B-01: schema 版本。当前最新版本为 2。
+# B-01: schema 版本。当前最新版本为 3。
 # 迁移采用顺序执行：旧库（user_version < SCHEMA_VERSION）逐版本升级；
 # 未知更高版本（user_version > SCHEMA_VERSION）启动时拒绝写入，防止旧代码破坏新库。
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
+
+# A-03: 任务状态机。
+JOB_PENDING = "pending"
+JOB_RUNNING = "running"
+JOB_SUCCEEDED = "succeeded"
+JOB_WAITING_DATA = "waiting_data"
+JOB_RETRYABLE_FAILED = "retryable_failed"
+JOB_PERMANENT_FAILED = "permanent_failed"
+JOB_STATES = {JOB_PENDING, JOB_RUNNING, JOB_SUCCEEDED, JOB_WAITING_DATA,
+              JOB_RETRYABLE_FAILED, JOB_PERMANENT_FAILED}
 
 # 日线字段映射：上游字段名（baostock 返回键）→ daily_bars 存储列名。
 DAILY_FIELD_MAP = {
@@ -110,11 +120,44 @@ MIGRATIONS: dict[int, list[Any]] = {
         lambda db: _add_column_if_missing(db, "daily_bars", "psTTM", "REAL"),
         lambda db: _add_column_if_missing(db, "daily_bars", "pcfNcfTTM", "REAL"),
     ],
+    # A-03: 任务状态机字段 + 财务修订历史表 + 旧 done 迁移。
+    3: [
+        lambda db: _add_column_if_missing(db, "download_jobs", "window_start", "TEXT"),
+        lambda db: _add_column_if_missing(db, "download_jobs", "window_end", "TEXT"),
+        lambda db: _add_column_if_missing(db, "download_jobs", "next_retry_at", "TEXT"),
+        lambda db: _add_column_if_missing(db, "download_jobs", "lease_expires_at", "TEXT"),
+        lambda db: _add_column_if_missing(db, "download_jobs", "rows_written", "INTEGER"),
+        lambda db: _add_column_if_missing(db, "download_jobs", "error_class", "TEXT"),
+        """CREATE TABLE IF NOT EXISTS financial_history (
+            dataset TEXT NOT NULL, code TEXT NOT NULL,
+            year INTEGER NOT NULL, quarter INTEGER NOT NULL,
+            revision INTEGER NOT NULL, payload TEXT NOT NULL,
+            fetched_at TEXT NOT NULL,
+            PRIMARY KEY(dataset, code, year, quarter, revision))""",
+        # 旧 'done' 状态迁移为 'succeeded'（A-03：保留完成语义但允许后续按规则刷新）。
+        lambda db: _migrate_legacy_done(db),
+    ],
 }
 
 
+def _migrate_legacy_done(db: sqlite3.Connection) -> None:
+    """A-03: 旧 download_jobs.status='done' 迁移为 'succeeded'。
+
+    - 有事实记录：succeeded，允许按修订检查规则刷新（不无条件全量重抓）。
+    - 空财报/分红/复权等按新规则在调度时重新评估，这里只做状态归一。
+    """
+    tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    if "download_jobs" not in tables:
+        return
+    db.execute("UPDATE download_jobs SET status='succeeded' WHERE status='done'")
+
+
 def _add_column_if_missing(db: sqlite3.Connection, table: str, column: str, coltype: str) -> None:
-    """幂等 ADD COLUMN：列已存在时跳过（迁移可重复执行）。"""
+    """幂等 ADD COLUMN：表或列不存在时跳过（迁移可重复执行、可跨版本安全）。"""
+    tables = {row[0] for row in db.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'")}
+    if table not in tables:
+        return
     columns = {row[1] for row in db.execute(f"PRAGMA table_info({table})")}
     if column not in columns:
         db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
@@ -159,12 +202,23 @@ def _merge_date_windows(missing_dates: list[str]) -> list[dict[str, Any]]:
 
 def _migrate_daily_bars_legacy(db: sqlite3.Connection) -> None:
     """daily_bars 旧结构（payload 列、无 code 列）迁移：重命名为 legacy 保留历史数据。"""
+    tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    if "daily_bars" not in tables:
+        return
     columns = {row[1] for row in db.execute("PRAGMA table_info(daily_bars)")}
     if columns and "payload" in columns and "code" not in columns:
         db.execute("ALTER TABLE daily_bars RENAME TO daily_bars_legacy")
 
 
 class Storage:
+    # A-03: 任务状态机常量（类属性别名，便于 storage 实例直接访问）。
+    JOB_PENDING = JOB_PENDING
+    JOB_RUNNING = JOB_RUNNING
+    JOB_SUCCEEDED = JOB_SUCCEEDED
+    JOB_WAITING_DATA = JOB_WAITING_DATA
+    JOB_RETRYABLE_FAILED = JOB_RETRYABLE_FAILED
+    JOB_PERMANENT_FAILED = JOB_PERMANENT_FAILED
+
     def __init__(self, db_path: str, log_path: str, clock: Clock | None = None):
         self.db_path, self.log_path = db_path, log_path
         # A-01: 可注入时钟。业务日/预算计数按 Asia/Shanghai 划日；审计时间 UTC。
@@ -582,24 +636,47 @@ class Storage:
     # ---------- download budget (fetcher only; MCP keeps using usage table) ----------
     # A-01: 预算计数实现已上移至类首部（按 Asia/Shanghai 业务日，含保守旧键读取）。
 
-    # ---------- download jobs (断点续传) ----------
+    # ---------- download jobs (A-03: 可重查任务状态机) ----------
 
-    def job_upsert(self, dataset: str, batch_id: str, status: str, error: str | None = None):
+    def job_upsert(self, dataset: str, batch_id: str, status: str, error: str | None = None,
+                   window_start: str | None = None, window_end: str | None = None,
+                   next_retry_at: str | None = None, lease_expires_at: str | None = None,
+                   rows_written: int | None = None, error_class: str | None = None):
+        """写入/更新任务状态。attempts 在每次更新时 +1（用于退避重试计数）。
+
+        A-03：记录请求窗口、下次重试时间、租约到期、行数与错误分类，供状态机调度。
+        """
+        if status not in JOB_STATES:
+            raise ValueError(f"invalid job status: {status}")
         now = self.clock.now_utc().isoformat()
         with self._session() as db:
-            db.execute("""INSERT INTO download_jobs(dataset, batch_id, status, attempts, error, updated_at)
-                VALUES (?, ?, ?, 1, ?, ?)
+            db.execute("""INSERT INTO download_jobs
+                (dataset, batch_id, status, attempts, error, updated_at,
+                 window_start, window_end, next_retry_at, lease_expires_at,
+                 rows_written, error_class)
+                VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(dataset, batch_id) DO UPDATE SET
                     status=excluded.status,
                     attempts=download_jobs.attempts+1,
                     error=excluded.error,
-                    updated_at=excluded.updated_at""",
-                (dataset, batch_id, status, error, now))
+                    updated_at=excluded.updated_at,
+                    window_start=excluded.window_start,
+                    window_end=excluded.window_end,
+                    next_retry_at=excluded.next_retry_at,
+                    lease_expires_at=excluded.lease_expires_at,
+                    rows_written=excluded.rows_written,
+                    error_class=excluded.error_class""",
+                (dataset, batch_id, status, error, now,
+                 window_start, window_end, next_retry_at, lease_expires_at,
+                 rows_written, error_class))
 
     def job_status(self, dataset: str, batch_id: str) -> str | None:
         with self._session() as db:
             row = db.execute("SELECT status FROM download_jobs WHERE dataset=? AND batch_id=?", (dataset, batch_id)).fetchone()
-        return row[0] if row else None
+        if not row:
+            return None
+        # 读时归一化：兼容迁移前遗留的旧 'done' 状态（A-03）。
+        return JOB_SUCCEEDED if row[0] == "done" else row[0]
 
     def job_stats(self, dataset: str | None = None) -> dict[str, int]:
         with self._session() as db:
@@ -607,11 +684,152 @@ class Storage:
                 rows = db.execute("SELECT status, COUNT(*) FROM download_jobs WHERE dataset=? GROUP BY status", (dataset,)).fetchall()
             else:
                 rows = db.execute("SELECT status, COUNT(*) FROM download_jobs GROUP BY status").fetchall()
-        stats = {"done": 0, "pending": 0, "failed": 0, "total": 0}
+        stats = {state: 0 for state in JOB_STATES}
+        stats["total"] = 0
         for status, count in rows:
             stats[status] = count
             stats["total"] += count
+        # 向后兼容：旧客户端依赖 'done' 键（= succeeded 数量）。
+        stats["done"] = stats[JOB_SUCCEEDED]
         return stats
+
+    # ---------- A-03: 状态机辅助（租约 / 到期 / 重启回收） ----------
+
+    def job_claim(self, dataset: str, batch_id: str, lease_seconds: int) -> bool:
+        """将 pending/waiting_data/retryable_failed 且已到期任务置为 running（领租约）。
+
+        返回是否成功领取；running/succeeded/permanent_failed 或未到期不领取。
+        """
+        now_iso = self.clock.now_utc().isoformat()
+        lease_expires = (self.clock.now_utc().timestamp() + lease_seconds)
+        from datetime import datetime
+        lease_iso = datetime.fromtimestamp(lease_expires, tz=timezone.utc).isoformat()
+        with self._session() as db:
+            row = db.execute(
+                """SELECT 1 FROM download_jobs WHERE dataset=? AND batch_id=?
+                   AND status IN (?,?,?)
+                   AND (next_retry_at IS NULL OR next_retry_at <= ?)""",
+                (dataset, batch_id, JOB_PENDING, JOB_WAITING_DATA, JOB_RETRYABLE_FAILED, now_iso)
+            ).fetchone()
+            if row is None:
+                return False
+            db.execute(
+                """UPDATE download_jobs SET status=?, lease_expires_at=?, updated_at=?
+                   WHERE dataset=? AND batch_id=?""",
+                (JOB_RUNNING, lease_iso, now_iso, dataset, batch_id))
+            return True
+
+    def job_release(self, dataset: str, batch_id: str, status: str,
+                    next_retry_at: str | None = None, rows_written: int | None = None,
+                    error: str | None = None, error_class: str | None = None):
+        """释放租约并置为终态/等待态。succeeded 清除租约；waiting_data/retryable_failed 记录重试时间。"""
+        if status not in JOB_STATES:
+            raise ValueError(f"invalid job status: {status}")
+        now = self.clock.now_utc().isoformat()
+        with self._session() as db:
+            db.execute(
+                """UPDATE download_jobs SET status=?, lease_expires_at=NULL,
+                   next_retry_at=?, rows_written=COALESCE(?, rows_written),
+                   error=?, error_class=?, updated_at=?
+                   WHERE dataset=? AND batch_id=?""",
+                (status, next_retry_at, rows_written, error, error_class, now, dataset, batch_id))
+
+    def job_recover_stale_running(self) -> int:
+        """A-03: 重启回收——回收租约过期的 running 任务为 retryable_failed。
+
+        进程重启后旧租约（lease_expires_at < now 或为 NULL）无法续期，
+        视为僵死任务，转 retryable_failed 以便后续按退避重试；返回回收数量。
+        """
+        now_iso = self.clock.now_utc().isoformat()
+        with self._session() as db:
+            cur = db.execute(
+                """UPDATE download_jobs SET status=?, lease_expires_at=NULL,
+                   error='recovered stale running task after restart',
+                   error_class='restart_recovery', updated_at=?
+                   WHERE status=? AND (lease_expires_at IS NULL OR lease_expires_at < ?)""",
+                (JOB_RETRYABLE_FAILED, now_iso, JOB_RUNNING, now_iso))
+            return cur.rowcount
+
+    def job_due(self, dataset: str, limit: int = 100) -> list[tuple[str, str]]:
+        """返回 dataset 下已到期可领取的任务 (batch_id, next_retry_at)。"""
+        now_iso = self.clock.now_utc().isoformat()
+        with self._session() as db:
+            rows = db.execute(
+                """SELECT batch_id, next_retry_at FROM download_jobs
+                   WHERE dataset=? AND status IN (?,?,?)
+                     AND (next_retry_at IS NULL OR next_retry_at <= ?)
+                   ORDER BY COALESCE(next_retry_at, '0000-01-01') LIMIT ?""",
+                (dataset, JOB_PENDING, JOB_WAITING_DATA, JOB_RETRYABLE_FAILED, now_iso, limit)).fetchall()
+        return [(r[0], r[1]) for r in rows]
+
+    def job_attempts(self, dataset: str, batch_id: str) -> int:
+        """任务尝试次数（退避计算用）。"""
+        with self._session() as db:
+            row = db.execute(
+                "SELECT attempts FROM download_jobs WHERE dataset=? AND batch_id=?",
+                (dataset, batch_id)).fetchone()
+        return row[0] if row else 0
+
+    def _job_row(self, dataset: str, batch_id: str) -> dict[str, Any] | None:
+        """任务完整行（状态机调度只读）。"""
+        with self._session() as db:
+            row = db.execute(
+                """SELECT dataset, batch_id, status, attempts, error, updated_at,
+                          window_start, window_end, next_retry_at, lease_expires_at,
+                          rows_written, error_class
+                   FROM download_jobs WHERE dataset=? AND batch_id=?""",
+                (dataset, batch_id)).fetchone()
+        if not row:
+            return None
+        keys = ("dataset", "batch_id", "status", "attempts", "error", "updated_at",
+                "window_start", "window_end", "next_retry_at", "lease_expires_at",
+                "rows_written", "error_class")
+        return dict(zip(keys, row))
+
+    # 事务内版本：供 fetcher 在同一个事务里提交事实数据与作业状态（A-03 同事务提交）。
+
+    @staticmethod
+    def _job_upsert_in_txn(db: sqlite3.Connection, dataset: str, batch_id: str, status: str,
+                           error: str | None = None, next_retry_at: str | None = None,
+                           rows_written: int | None = None, error_class: str | None = None):
+        if status not in JOB_STATES:
+            raise ValueError(f"invalid job status: {status}")
+        now = datetime.now(timezone.utc).isoformat()
+        db.execute("""INSERT INTO download_jobs
+            (dataset, batch_id, status, attempts, error, updated_at,
+             next_retry_at, rows_written, error_class)
+            VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?)
+            ON CONFLICT(dataset, batch_id) DO UPDATE SET
+                status=excluded.status,
+                attempts=download_jobs.attempts+1,
+                error=excluded.error,
+                updated_at=excluded.updated_at,
+                next_retry_at=excluded.next_retry_at,
+                rows_written=excluded.rows_written,
+                error_class=excluded.error_class""",
+            (dataset, batch_id, status, error, now, next_retry_at, rows_written, error_class))
+
+    @staticmethod
+    def _put_financials_in_txn(db: sqlite3.Connection, dataset: str, code: str,
+                               year: int, quarter: int, payload: dict[str, Any],
+                               fetched_at: str | None = None):
+        """事务内写财务数据（含修订归档），与 job 状态同事务提交。"""
+        now = fetched_at or datetime.now(timezone.utc).isoformat()
+        old = db.execute(
+            "SELECT payload, fetched_at FROM financials WHERE dataset=? AND code=? AND year=? AND quarter=?",
+            (dataset, code, year, quarter)).fetchone()
+        if old is not None:
+            old_payload = old[0]
+            if old_payload != json.dumps(payload, ensure_ascii=False):
+                rev = db.execute(
+                    "SELECT COALESCE(MAX(revision), 0) FROM financial_history WHERE dataset=? AND code=? AND year=? AND quarter=?",
+                    (dataset, code, year, quarter)).fetchone()[0]
+                db.execute("""INSERT INTO financial_history
+                    (dataset, code, year, quarter, revision, payload, fetched_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (dataset, code, year, quarter, rev + 1, old_payload, old[1]))
+        db.execute("""INSERT OR REPLACE INTO financials(dataset, code, year, quarter, payload, fetched_at)
+            VALUES (?, ?, ?, ?, ?, ?)""", (dataset, code, year, quarter, json.dumps(payload, ensure_ascii=False), now))
 
     # ---------- securities ----------
 
@@ -699,11 +917,25 @@ class Storage:
                     (index_code,)).fetchall()
         return [r[0] for r in rows]
 
-    # ---------- financials ----------
+    # ---------- financials (A-03: 修订版本留存 + 修订检查) ----------
 
     def put_financials(self, dataset: str, code: str, year: int, quarter: int, payload: dict[str, Any]):
-        now = datetime.now(timezone.utc).isoformat()
+        """写入财务数据；若与已有版本不同，先归档旧版本到 financial_history。"""
+        now = self.clock.now_utc().isoformat()
         with self._session() as db:
+            old = db.execute(
+                "SELECT payload, fetched_at FROM financials WHERE dataset=? AND code=? AND year=? AND quarter=?",
+                (dataset, code, year, quarter)).fetchone()
+            if old is not None:
+                old_payload = old[0]
+                if old_payload != json.dumps(payload, ensure_ascii=False):
+                    rev = db.execute(
+                        "SELECT COALESCE(MAX(revision), 0) FROM financial_history WHERE dataset=? AND code=? AND year=? AND quarter=?",
+                        (dataset, code, year, quarter)).fetchone()[0]
+                    db.execute("""INSERT INTO financial_history
+                        (dataset, code, year, quarter, revision, payload, fetched_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                        (dataset, code, year, quarter, rev + 1, old_payload, old[1]))
             db.execute("""INSERT OR REPLACE INTO financials(dataset, code, year, quarter, payload, fetched_at)
                 VALUES (?, ?, ?, ?, ?, ?)""", (dataset, code, year, quarter, json.dumps(payload, ensure_ascii=False), now))
 
@@ -712,6 +944,30 @@ class Storage:
             row = db.execute("SELECT 1 FROM financials WHERE dataset=? AND code=? AND year=? AND quarter=?",
                 (dataset, code, year, quarter)).fetchone()
         return row is not None
+
+    def financial_fetched_at(self, dataset: str, code: str, year: int, quarter: int) -> str | None:
+        """财务数据最近采集时间（修订检查用）。"""
+        with self._session() as db:
+            row = db.execute(
+                "SELECT fetched_at FROM financials WHERE dataset=? AND code=? AND year=? AND quarter=?",
+                (dataset, code, year, quarter)).fetchone()
+        return row[0] if row else None
+
+    def financial_history(self, dataset: str, code: str, year: int, quarter: int) -> list[dict[str, Any]]:
+        """财务修订历史（含当前版本，降序）。"""
+        with self._session() as db:
+            cur = db.execute(
+                "SELECT payload, fetched_at FROM financials WHERE dataset=? AND code=? AND year=? AND quarter=?",
+                (dataset, code, year, quarter)).fetchone()
+            hist = db.execute(
+                "SELECT revision, payload, fetched_at FROM financial_history WHERE dataset=? AND code=? AND year=? AND quarter=? ORDER BY revision DESC",
+                (dataset, code, year, quarter)).fetchall()
+        out = []
+        if cur:
+            out.append({"revision": len(hist) + 1, "data": json.loads(cur[0]), "fetched_at": cur[1]})
+        for rev, payload, fetched_at in hist:
+            out.append({"revision": rev, "data": json.loads(payload), "fetched_at": fetched_at})
+        return out
 
     def get_financials(self, dataset: str, code: str) -> list[dict[str, Any]]:
         with self._session() as db:
@@ -775,7 +1031,7 @@ class Storage:
                 WHERE s.status IN ('', '1')
                   AND (b.m IS NULL OR b.m < ?)
                   -- SQL 三值逻辑：LEFT JOIN 无匹配时 j.* 为 NULL，必须显式放行
-                  AND (j.batch_id IS NULL OR NOT (j.status='done' AND substr(j.updated_at, 1, 10) = ?))
+                  AND (j.batch_id IS NULL OR NOT (j.status='succeeded' AND substr(j.updated_at, 1, 10) = ?))
                 ORDER BY s.code
                 LIMIT ?""", (primary_adjustflag, primary_adjustflag, end_date, today, limit)).fetchall()
         return [r[0] for r in rows]

@@ -115,6 +115,13 @@ class Fetcher:
 
     def _run(self):
         self._set_state(current="fetcher started")
+        # A-03: 重启回收——进程重启后回收过期 running 任务，避免任务永久卡死。
+        try:
+            recovered = self.storage.job_recover_stale_running()
+            if recovered:
+                self._set_state(current=f"recovered {recovered} stale running job(s)")
+        except Exception as exc:
+            self._set_state(last_error=f"startup recovery failed: {exc}")
         while not self.stop_event.is_set():
             if self.settings.offline:
                 self._set_state(running=False, current="offline mode; fetcher idle")
@@ -350,7 +357,7 @@ class Fetcher:
                         }, use_cache=False, priority=1)
                         self.storage.increment_download_usage()
                 # 无缺口时无需请求；仍记录 job（用于当日去重/断点续传）。
-                self.storage.job_upsert("daily_bars", f"{code}|{af}", "done")
+                self.storage.job_upsert("daily_bars", f"{code}|{af}", self.storage.JOB_SUCCEEDED)
             done += 1
             self._set_state(done=done)
         self._set_state(current=f"daily backfill batch done: {done} codes")
@@ -365,10 +372,71 @@ class Fetcher:
                 (start_date, end_date)).fetchall()
         return [r[0] for r in rows]
 
-    # ---------- financials backfill (按 code × year × quarter，倒序优先最新) ----------
+    # ---------- financials backfill (A-03: 状态机 + 修订检查 + 退避) ----------
 
     def _need_financial_backfill(self) -> bool:
         return self.storage.count_securities() > 0
+
+    def _current_ended_quarter(self) -> tuple[int, int]:
+        """当前已结束季度：上海业务日所在季度往前推（季度结束后才视为已结束）。
+
+        例：10月（Q4 进行中）→ 已结束季度为 Q3；1月 → 上一年 Q4。
+        """
+        now = self.clock.business_date()
+        quarter = (now.month - 1) // 3 + 1
+        if quarter == 1:
+            return now.year - 1, 4
+        return now.year, quarter - 1
+
+    def _is_future_quarter(self, year: int, quarter: int) -> bool:
+        """未来未结束季度不入队。"""
+        ended = self._current_ended_quarter()
+        return (year, quarter) > ended
+
+    def _retry_delay(self, attempts: int) -> str:
+        """指数退避：60s 起、翻倍、最长 1h；返回 UTC ISO 时间（可注入时钟）。"""
+        delay = min(self.settings.task_retry_base_seconds * (2 ** max(0, attempts - 1)),
+                    self.settings.task_retry_max_seconds)
+        return self.storage.clock.now_utc().timestamp() + delay
+
+    def _iso_from_ts(self, ts: float) -> str:
+        return datetime.datetime.fromtimestamp(ts, tz=datetime.timezone.utc).isoformat()
+
+    def _financial_job_due(self, ds: str, code: str, year: int, quarter: int) -> tuple[bool, str]:
+        """判断财务任务是否到期执行；返回 (是否执行, 原因)。
+
+        - succeeded：按修订检查周期（近两季度每天/其余 30 天）判断是否到期重查。
+        - waiting_data：next_retry_at 到期（空财报 24h 后重查）。
+        - retryable_failed/pending/无记录：执行。
+        - permanent_failed：不再执行（需人工处置）。
+        """
+        job_id = f"{code}|{year}Q{quarter}|{ds}"
+        status = self.storage.job_status("financials", job_id)
+        now_iso = self.storage.clock.now_utc().isoformat()
+        if status == self.storage.JOB_PERMANENT_FAILED:
+            return False, "permanent_failed"
+        if status == self.storage.JOB_SUCCEEDED:
+            fetched = self.storage.financial_fetched_at(ds, code, year, quarter)
+            if not fetched:
+                return True, "succeeded but no fact row (recheck)"
+            ended_year, ended_q = self._current_ended_quarter()
+            recent = (year, quarter) >= (ended_year - 0, ended_q - 1) and \
+                     (year, quarter) <= (ended_year, ended_q)
+            # 近两个已结束季度每天检查，其余 30 天检查
+            days = self.settings.financial_revision_check_days if recent else \
+                self.settings.financial_revision_check_days_full
+            from datetime import datetime as _dt
+            fetched_dt = _dt.fromisoformat(fetched)
+            threshold = self.storage.clock.now_utc().timestamp() - days * 86400
+            if fetched_dt.timestamp() < threshold:
+                return True, f"revision check due (>{days}d)"
+            return False, "revision check not due"
+        if status == self.storage.JOB_WAITING_DATA:
+            row = self.storage._job_row("financials", job_id)
+            if row and row["next_retry_at"] and row["next_retry_at"] > now_iso:
+                return False, "waiting_data not due"
+            return True, "waiting_data retry due"
+        return True, f"status={status or 'none'}"
 
     def _fetch_financial_batch(self) -> bool:
         codes = self.storage.get_securities_codes()
@@ -381,58 +449,130 @@ class Fetcher:
                 raise BudgetExhausted()
             for year in range(current_year, self.settings.fetch_financial_start_year - 1, -1):
                 for quarter in (4, 3, 2, 1):
+                    if self._is_future_quarter(year, quarter):
+                        continue  # 未来未结束季度不入队
                     for ds in datasets:
                         if ds not in FINANCIAL_METHODS:
                             continue
-                        # 已落库或已标记 done（含空报告期，如未发布的季度）都跳过，
-                        # 否则空报告期会在每轮循环里反复查询形成死循环。
-                        if self.storage.financial_exists(ds, code, year, quarter) or \
-                           self.storage.job_status("financials", f"{code}|{year}Q{quarter}|{ds}") == "done":
+                        due, reason = self._financial_job_due(ds, code, year, quarter)
+                        if not due:
                             continue
-                        self._set_state(current=f"financials: {code} {year}Q{quarter} {ds}",
+                        job_id = f"{code}|{year}Q{quarter}|{ds}"
+                        self._set_state(current=f"financials: {code} {year}Q{quarter} {ds} ({reason})",
                                         dataset="financials", done=1, total=1)
-                        res = self._bounded_call(FINANCIAL_METHODS[ds], {"code": code, "year": year, "quarter": quarter})
-                        for row in res["data"]:
-                            self.storage.put_financials(ds, code, year, quarter, row)
-                        self.storage.job_upsert("financials", f"{code}|{year}Q{quarter}|{ds}", "done")
-                        return True  # 一次只处理一个请求，回到主循环继续（便于预算/心跳控制）
+                        try:
+                            res = self._bounded_call(
+                                FINANCIAL_METHODS[ds],
+                                {"code": code, "year": year, "quarter": quarter})
+                            # 同事务提交：财务数据 + 任务成功状态（成功数据与作业完成状态同事务）。
+                            with self.storage._session() as db:
+                                if res["data"]:
+                                    for row in res["data"]:
+                                        self.storage._put_financials_in_txn(
+                                            db, ds, code, year, quarter, row,
+                                            fetched_at=self.storage.clock.now_utc().isoformat())
+                                    self.storage._job_upsert_in_txn(
+                                        db, "financials", job_id, self.storage.JOB_SUCCEEDED,
+                                        rows_written=len(res["data"]))
+                                else:
+                                    # 空财报：不写事实行，标记 waiting_data 等待披露窗口重查。
+                                    self.storage._job_upsert_in_txn(
+                                        db, "financials", job_id, self.storage.JOB_WAITING_DATA,
+                                        next_retry_at=self._iso_from_ts(
+                                            self.storage.clock.now_utc().timestamp()
+                                            + self.settings.financial_waiting_retry_hours * 3600),
+                                        error="empty report period (waiting for release)")
+                            return True
+                        except BudgetExhausted:
+                            raise
+                        except Exception as exc:
+                            # 网络失败指数退避；失败股票不阻塞后续任务（捕获后继续）。
+                            attempts = self.storage.job_attempts("financials", job_id) + 1
+                            self.storage.job_upsert(
+                                "financials", job_id, self.storage.JOB_RETRYABLE_FAILED,
+                                error=str(exc), error_class=type(exc).__name__,
+                                next_retry_at=self._iso_from_ts(self._retry_delay(attempts)))
+                            self._set_state(last_error=f"financials {job_id}: {exc}")
         return False
 
-    # ---------- dividends / adjust factors (默认关闭) ----------
+    # ---------- dividends / adjust factors (A-03: 检查窗口增量更新) ----------
 
     def _need_dividends(self) -> bool:
         return True
 
     def _fetch_dividends_batch(self) -> bool:
+        """分红按检查窗口增量更新：不再按股票永久完成。
+
+        succeeded 且未到检查窗口 → 跳过；否则重新查询并刷新事实行。
+        """
         codes = self.storage.get_securities_codes()
         for code in codes:
             if self.budget_left() <= 0:
                 raise BudgetExhausted()
-            if self.storage.dividend_exists(code, 0, "all"):
-                continue
+            job_id = f"{code}|all"
+            status = self.storage.job_status("dividends", job_id)
+            if status == self.storage.JOB_SUCCEEDED:
+                # 检查窗口：succeeded 后 30 天内不重复（分红低频，按窗口刷新）
+                row = self.storage._job_row("dividends", job_id)
+                if row and row["updated_at"]:
+                    from datetime import datetime as _dt
+                    try:
+                        fetched_dt = _dt.fromisoformat(row["updated_at"])
+                        if self.storage.clock.now_utc().timestamp() - fetched_dt.timestamp() < 30 * 86400:
+                            continue
+                    except ValueError:
+                        pass
             self._set_state(current=f"dividends: {code}", dataset="dividends")
-            res = self._bounded_call("query_dividend_data", {"code": code, "year": 0})
-            self.storage.put_dividend(code, 0, "all", res["data"])
-            self.storage.job_upsert("dividends", f"{code}|all", "done")
+            try:
+                res = self._bounded_call("query_dividend_data", {"code": code, "year": 0})
+                self.storage.put_dividend(code, 0, "all", res["data"])
+                self.storage.job_upsert("dividends", job_id, self.storage.JOB_SUCCEEDED,
+                                        rows_written=len(res["data"]))
+            except BudgetExhausted:
+                raise
+            except Exception as exc:
+                attempts = self.storage.job_attempts("dividends", job_id) + 1
+                self.storage.job_upsert("dividends", job_id, self.storage.JOB_RETRYABLE_FAILED,
+                                        error=str(exc), error_class=type(exc).__name__,
+                                        next_retry_at=self._iso_from_ts(self._retry_delay(attempts)))
             return True
         return False
 
     def _fetch_adjust_factors_batch(self) -> bool:
+        """复权因子按检查窗口增量更新：不再按股票永久完成。"""
         codes = self.storage.get_securities_codes()
         for code in codes:
             if self.budget_left() <= 0:
                 raise BudgetExhausted()
-            if self.storage.job_status("adjust_factors", code) == "done":
-                continue
+            status = self.storage.job_status("adjust_factors", code)
+            if status == self.storage.JOB_SUCCEEDED:
+                row = self.storage._job_row("adjust_factors", code)
+                if row and row["updated_at"]:
+                    from datetime import datetime as _dt
+                    try:
+                        fetched_dt = _dt.fromisoformat(row["updated_at"])
+                        if self.storage.clock.now_utc().timestamp() - fetched_dt.timestamp() < 7 * 86400:
+                            continue
+                    except ValueError:
+                        pass
             self._set_state(current=f"adjust_factors: {code}", dataset="adjust_factors")
-            res = self._bounded_call("query_adjust_factor", {
-                "code": code,
-                "start_date": self.settings.fetch_daily_start_date,
-                "end_date": self.business_today,
-            })
-            rows = [r for r in res["data"] if r.get("date")]
-            self.storage.put_adjust_factors(code, rows)
-            self.storage.job_upsert("adjust_factors", code, "done")
+            try:
+                res = self._bounded_call("query_adjust_factor", {
+                    "code": code,
+                    "start_date": self.settings.fetch_daily_start_date,
+                    "end_date": self.business_today,
+                })
+                rows = [r for r in res["data"] if r.get("date")]
+                self.storage.put_adjust_factors(code, rows)
+                self.storage.job_upsert("adjust_factors", code, self.storage.JOB_SUCCEEDED,
+                                        rows_written=len(rows))
+            except BudgetExhausted:
+                raise
+            except Exception as exc:
+                attempts = self.storage.job_attempts("adjust_factors", code) + 1
+                self.storage.job_upsert("adjust_factors", code, self.storage.JOB_RETRYABLE_FAILED,
+                                        error=str(exc), error_class=type(exc).__name__,
+                                        next_retry_at=self._iso_from_ts(self._retry_delay(attempts)))
             return True
         return False
 
