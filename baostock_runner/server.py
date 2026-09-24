@@ -23,11 +23,13 @@ atexit.register(fetcher.stop)
 
 @mcp.tool()
 def get_stock_daily_bars(code: str, start_date: str, end_date: str,
-                         adjust: str = "none", fields: str = "date,code,open,high,low,close,volume,amount,pctChg,turn") -> dict:
+                         adjust: str = "none", fields: str = "date,code,open,high,low,close,volume,amount,pctChg,turn",
+                         force_refresh: bool = False) -> dict:
     """Get daily A-share bars through the single queued BaoStock connection.
 
     code examples: sh.600000, sz.000001, bj.430047. adjust is none, forward, or backward.
-    Dates use YYYY-MM-DD.
+    Dates use YYYY-MM-DD. force_refresh=True bypasses both the parameter cache and the
+    local fact-table coverage check (full-range re-fetch; merged so old fields are kept).
     """
     if not re.fullmatch(r"(?:sh|sz|bj)\.\d{6}", code):
         raise ValueError("code must look like sh.600000, sz.000001, or bj.430047")
@@ -41,7 +43,7 @@ def get_stock_daily_bars(code: str, start_date: str, end_date: str,
     return gateway.daily_bars({
         "code": code, "fields": fields, "start_date": start_date, "end_date": end_date,
         "frequency": "d", "adjustflag": adjustflag,
-    })
+    }, force_refresh=force_refresh)
 
 
 def _date(value: str, name: str):

@@ -106,14 +106,24 @@ class BaoStockGateway:
             raise value
         return value
 
-    def daily_bars(self, params: dict[str, Any], use_cache: bool = True, priority: int = 0) -> dict[str, Any]:
-        """Read local daily bars and only fetch the missing tail from BaoStock."""
+    def daily_bars(self, params: dict[str, Any], use_cache: bool = True, priority: int = 0,
+                   force_refresh: bool = False) -> dict[str, Any]:
+        """Read local daily bars and fetch missing ranges from BaoStock.
+
+        A-02：force_refresh=True 时同时绕过参数缓存（use_cache 视为 False）与
+        事实表"已覆盖"短路（即使本地已到 end_date 也全区间重查）。
+        写入采用字段级合并（storage.put_daily_bars merge=True），窄字段刷新不丢旧字段。
+        """
         code, frequency, adjustflag = params["code"], params["frequency"], params["adjustflag"]
         start_date, end_date = params["start_date"], params["end_date"]
         local = self.storage.get_daily_bars(code, frequency, adjustflag, start_date, end_date)
         latest = self.storage.latest_daily_bar(code, frequency, adjustflag)
         fetched = False
-        if latest is None or not local:
+        if force_refresh:
+            # 强制刷新：绕过事实表覆盖判断，全区间重查（含已覆盖的头部/中间区间）。
+            query_params = dict(params)
+            use_cache = False
+        elif latest is None or not local:
             query_params = dict(params)
         elif latest < end_date:
             query_params = dict(params, start_date=latest, end_date=end_date)
@@ -122,7 +132,8 @@ class BaoStockGateway:
         if query_params is not None:
             result = self.call("query_history_k_data_plus", query_params, use_cache=use_cache, priority=priority)
             new_rows = result["data"]
-            self.storage.put_daily_bars(code, frequency, adjustflag, new_rows)
+            # merge=True：窄字段/强制刷新不覆盖旧字段值（A-02 验收）。
+            self.storage.put_daily_bars(code, frequency, adjustflag, new_rows, merge=True)
             fetched = not result["cache_hit"]
             local = self.storage.get_daily_bars(code, frequency, adjustflag, start_date, end_date)
         columns = [field.strip() for field in params["fields"].split(",")]
@@ -135,6 +146,7 @@ class BaoStockGateway:
             "rows": rows,
             "cache_hit": not fetched,
             "incremental": True,
+            "force_refresh": force_refresh,
             "request_count_today": self.storage.usage_today(),
         }
 
@@ -277,7 +289,16 @@ class BaoStockGateway:
             raise RuntimeError("Daily BaoStock request hard limit reached")
         if self.settings.offline:
             fields = [field.strip() for field in p.get("fields", "date,code").split(",")]
-            row = {field: (p.get("code") if field == "code" else p.get("start_date", "")) for field in fields}
+            # 离线模拟行：code 用代码、date 用 start_date、其余字段用合法数值，
+            # 避免日期字符串被 _number 转浮点失败（A-02 字段提升测试依赖）。
+            row = {}
+            for field in fields:
+                if field == "code":
+                    row[field] = p.get("code", "")
+                elif field == "date":
+                    row[field] = p.get("start_date", "")
+                else:
+                    row[field] = "10.0"
             rows = [row]
             count = self.storage.increment_usage()
         else:

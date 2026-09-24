@@ -7,10 +7,23 @@ from typing import Any, Callable
 
 from .timeutil import Clock
 
-# B-01: schema 版本。当前最新版本为 1（把既有全部表固化为版本 1 的迁移）。
+# B-01: schema 版本。当前最新版本为 2。
 # 迁移采用顺序执行：旧库（user_version < SCHEMA_VERSION）逐版本升级；
 # 未知更高版本（user_version > SCHEMA_VERSION）启动时拒绝写入，防止旧代码破坏新库。
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+
+# 日线字段映射：上游字段名（baostock 返回键）→ daily_bars 存储列名。
+DAILY_FIELD_MAP = {
+    "open": "open", "high": "high", "low": "low", "close": "close",
+    "preclose": "preclose", "volume": "volume", "amount": "amount",
+    "pctChg": "pct_chg", "turn": "turn",
+    "tradestatus": "tradestatus", "isST": "isST",
+    "peTTM": "peTTM", "pbMRQ": "pbMRQ", "psTTM": "psTTM", "pcfNcfTTM": "pcfNcfTTM",
+}
+# 行情核心字段（不含估值/状态）：用于行情 vs 估值分别统计覆盖。
+DAILY_MARKET_FIELDS = ("open", "high", "low", "close", "preclose", "volume", "amount", "pctChg", "turn")
+# 估值字段：A-02 提升为可查询列。
+DAILY_VALUATION_FIELDS = ("peTTM", "pbMRQ", "psTTM", "pcfNcfTTM")
 
 # 迁移定义：version -> 有序步骤列表。每步为 SQL 字符串或 callable(db)。
 # 步骤全部幂等（CREATE TABLE IF NOT EXISTS / ALTER TABLE ... IF 已存在检测），
@@ -86,7 +99,62 @@ MIGRATIONS: dict[int, list[Any]] = {
         """CREATE TABLE IF NOT EXISTS dataset_meta (
             dataset TEXT PRIMARY KEY, last_updated TEXT, detail TEXT)""",
     ],
+    # A-02: 提升日线字段为可查询列（preclose/tradestatus/isST/估值字段）。
+    # 通过 ALTER TABLE ADD COLUMN 顺序迁移；列已存在时幂等跳过。
+    2: [
+        lambda db: _add_column_if_missing(db, "daily_bars", "preclose", "REAL"),
+        lambda db: _add_column_if_missing(db, "daily_bars", "tradestatus", "TEXT"),
+        lambda db: _add_column_if_missing(db, "daily_bars", "isST", "TEXT"),
+        lambda db: _add_column_if_missing(db, "daily_bars", "peTTM", "REAL"),
+        lambda db: _add_column_if_missing(db, "daily_bars", "pbMRQ", "REAL"),
+        lambda db: _add_column_if_missing(db, "daily_bars", "psTTM", "REAL"),
+        lambda db: _add_column_if_missing(db, "daily_bars", "pcfNcfTTM", "REAL"),
+    ],
 }
+
+
+def _add_column_if_missing(db: sqlite3.Connection, table: str, column: str, coltype: str) -> None:
+    """幂等 ADD COLUMN：列已存在时跳过（迁移可重复执行）。"""
+    columns = {row[1] for row in db.execute(f"PRAGMA table_info({table})")}
+    if column not in columns:
+        db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
+
+
+def _date_range(start_date: str, end_date: str) -> list[str]:
+    """生成 [start, end] 逐日 ISO 日期（含边界）；仅作为交易日历缺失时的兜底。"""
+    from datetime import date, timedelta
+    out: list[str] = []
+    cur = date.fromisoformat(start_date)
+    end = date.fromisoformat(end_date)
+    while cur <= end:
+        out.append(cur.isoformat())
+        cur += timedelta(days=1)
+    return out
+
+
+def _merge_date_windows(missing_dates: list[str]) -> list[dict[str, Any]]:
+    """将缺失日期合并为连续窗口 [start,end]，用于生成请求批次而非笛卡尔积。
+
+    输入为任意顺序的 ISO 日期，输出按时间排序的窗口列表。
+    """
+    from datetime import date, timedelta
+    if not missing_dates:
+        return []
+    windows: list[dict[str, Any]] = []
+    cur: list[date] = []
+    for d in sorted(set(missing_dates)):
+        day = date.fromisoformat(d)
+        if cur and (day - cur[-1]).days == 1:
+            cur.append(day)
+        else:
+            if cur:
+                windows.append({"start": cur[0].isoformat(), "end": cur[-1].isoformat(),
+                                "days": len(cur)})
+            cur = [day]
+    if cur:
+        windows.append({"start": cur[0].isoformat(), "end": cur[-1].isoformat(),
+                        "days": len(cur)})
+    return windows
 
 
 def _migrate_daily_bars_legacy(db: sqlite3.Connection) -> None:
@@ -303,13 +371,16 @@ class Storage:
         with self._session() as db:
             rows = db.execute(
                 """SELECT code, bar_date, frequency, adjustflag, open, high, low,
-                   close, volume, amount, pct_chg, turn
+                   close, preclose, volume, amount, pct_chg, turn,
+                   tradestatus, isST, peTTM, pbMRQ, psTTM, pcfNcfTTM
                    FROM daily_bars
                    WHERE code=? AND frequency=? AND adjustflag=?
                      AND bar_date BETWEEN ? AND ? ORDER BY bar_date""",
                 (code, frequency, adjustflag, start_date, end_date),
             ).fetchall()
-        keys = ("code", "date", "frequency", "adjustflag", "open", "high", "low", "close", "volume", "amount", "pctChg", "turn")
+        keys = ("code", "date", "frequency", "adjustflag", "open", "high", "low",
+                "close", "preclose", "volume", "amount", "pctChg", "turn",
+                "tradestatus", "isST", "peTTM", "pbMRQ", "psTTM", "pcfNcfTTM")
         return [dict(zip(keys, row)) for row in rows]
 
     def latest_daily_bar(self, code: str, frequency: str, adjustflag: str) -> str | None:
@@ -320,25 +391,50 @@ class Storage:
             ).fetchone()
         return row[0] if row and row[0] else None
 
-    def put_daily_bars(self, code: str, frequency: str, adjustflag: str, rows: list[dict[str, Any]]):
-        now = datetime.now(timezone.utc).isoformat()
+    def put_daily_bars(self, code: str, frequency: str, adjustflag: str,
+                       rows: list[dict[str, Any]], merge: bool = True):
+        """写入日线行。A-02：字段级合并，窄字段请求不覆盖旧值。
+
+        - merge=True（默认）：按 (code, bar_date, frequency, adjustflag) 读取旧行，
+          新行中出现的字段覆盖旧值，缺失字段保留旧值；避免"窄字段请求清空完整记录"。
+        - 上游明确返回的合法空值（空串/None）按接口语义保留为 NULL，不视为缺失。
+        """
+        now = self.clock.now_utc().isoformat()
+        # 预读旧行（仅当需要合并时）：只读本次写入涉及的日期窗口，避免全历史扫描。
+        old_by_date: dict[str, dict[str, Any]] = {}
+        if merge:
+            dates = sorted({r["date"] for r in rows if r.get("date")})
+            if dates:
+                for r in self.get_daily_bars(code, frequency, adjustflag, dates[0], dates[-1]):
+                    old_by_date[r["date"]] = r
         values = []
         for row in rows:
-            if not row.get("date"):
+            d = row.get("date")
+            if not d:
                 continue
+            merged = dict(old_by_date.get(d, {})) if merge else {}
+            # 仅覆盖新行中明确出现的字段；缺失字段（窄请求未包含）保留旧值。
+            for key, col in DAILY_FIELD_MAP.items():
+                if key in row:
+                    merged[key] = row[key]
             values.append((
-                code, row["date"], frequency, adjustflag,
-                self._number(row.get("open")), self._number(row.get("high")),
-                self._number(row.get("low")), self._number(row.get("close")),
-                self._number(row.get("volume")), self._number(row.get("amount")),
-                self._number(row.get("pctChg")), self._number(row.get("turn")),
-                json.dumps(row, ensure_ascii=False), now,
+                code, d, frequency, adjustflag,
+                self._number(merged.get("open")), self._number(merged.get("high")),
+                self._number(merged.get("low")), self._number(merged.get("close")),
+                self._number(merged.get("preclose")), self._number(merged.get("volume")),
+                self._number(merged.get("amount")), self._number(merged.get("pctChg")),
+                self._number(merged.get("turn")), merged.get("tradestatus"),
+                merged.get("isST"), self._number(merged.get("peTTM")),
+                self._number(merged.get("pbMRQ")), self._number(merged.get("psTTM")),
+                self._number(merged.get("pcfNcfTTM")),
+                json.dumps(merged, ensure_ascii=False), now,
             ))
         with self._session() as db:
             db.executemany("""INSERT OR REPLACE INTO daily_bars
                 (code, bar_date, frequency, adjustflag, open, high, low, close,
-                 volume, amount, pct_chg, turn, raw_json, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", values)
+                 preclose, volume, amount, pct_chg, turn, tradestatus, isST,
+                 peTTM, pbMRQ, psTTM, pcfNcfTTM, raw_json, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", values)
 
     @staticmethod
     def _number(value):
@@ -348,6 +444,115 @@ class Storage:
             return float(value)
         except (TypeError, ValueError):
             return None
+
+    # ---------- A-02: 日线覆盖检查（头部/中间/尾部缺口 + 状态区分） ----------
+
+    def get_daily_coverage(self, codes: list[str], start_date: str, end_date: str,
+                           adjustflag: str, frequency: str = "d",
+                           trade_dates: list[str] | None = None) -> dict[str, Any]:
+        """检查日线在指定区间内的覆盖情况，不再以 MAX(bar_date) 代表整个区间完整。
+
+        - 对每个证券，用交易日历（trade_dates，可显式传入）确定应覆盖的日期集。
+        - 将缺口按连续日期合并为请求窗口（头部/中间/尾部），不生成全市场笛卡尔积任务。
+        - 区分：expected（预期应覆盖）/ effective（有有效记录）/ excluded（合法排除，
+          如未上市/已退市/停牌）/ unknown（历史状态证据不足，不推断为完整）。
+        - 行情字段与估值字段分别统计有效数。
+        返回 dict，包含 per-code 覆盖、缺口窗口、各状态计数及总体状态。
+        """
+        result: dict[str, Any] = {
+            "scope": {"codes": len(codes), "start_date": start_date, "end_date": end_date,
+                      "frequency": frequency, "adjustflag": adjustflag},
+            "per_code": {},
+            "expected": 0, "effective": 0, "excluded": 0, "unknown": 0,
+            "market_effective": 0, "valuation_effective": 0,
+            "status": "complete",
+        }
+        if not codes:
+            return result
+
+        with self._session() as db:
+            # 每个 code 在区间内的实际行
+            actual: dict[str, dict[str, dict[str, Any]]] = {}
+            rows = db.execute(
+                """SELECT code, bar_date, open, high, low, close, volume, amount,
+                          preclose, peTTM, pbMRQ, psTTM, pcfNcfTTM, tradestatus
+                   FROM daily_bars
+                   WHERE frequency=? AND adjustflag=?
+                     AND bar_date BETWEEN ? AND ?""",
+                (frequency, adjustflag, start_date, end_date)).fetchall()
+            for r in rows:
+                actual.setdefault(r[0], {})[r[1]] = {
+                    "market": any(self._number(x) is not None for x in
+                                  (r[2], r[3], r[4], r[5], r[6], r[7], r[8])),
+                    "valuation": any(self._number(x) is not None for x in (r[9], r[10], r[11], r[12])),
+                    "tradestatus": r[13],
+                }
+            # 证券主数据：用于判断合法排除（未上市/已退市）与未知
+            sec_rows = {r[0]: r for r in db.execute(
+                "SELECT code, status, ipo_date, out_date FROM securities").fetchall()}
+
+        # 应覆盖日期集：优先显式交易日历，否则退化为请求区间逐日（仅作兜底）
+        expected_dates = trade_dates or [
+            d for d in _date_range(start_date, end_date)
+        ]
+
+        for code in codes:
+            sec = sec_rows.get(code)
+            dates = set(actual.get(code, {}))
+            missing = [d for d in expected_dates if d not in dates]
+            gaps = _merge_date_windows(missing) if missing else []
+
+            # 状态判定：合法排除优先；无证券记录/无法判断历史状态 → unknown
+            if sec is not None:
+                status_field = sec[1] or ""
+                ipo, out = sec[2] or "", sec[3] or ""
+                if out and out < start_date:
+                    state, reason = "excluded", f"delisted before {start_date}"
+                elif ipo and ipo > end_date:
+                    state, reason = "excluded", f"not listed until {ipo}"
+                elif status_field == "D":
+                    state, reason = "excluded", "delisted (status D)"
+                elif dates:
+                    state, reason = "effective", ""
+                elif gaps:
+                    state, reason = "unknown", "expected but no record; listing history insufficient"
+                else:
+                    state, reason = "effective", "no missing within scope"
+            else:
+                state, reason = "unknown", "no securities master record"
+
+            if state == "effective":
+                result["effective"] += 1
+                if dates:
+                    market_ok = any(actual[code][d]["market"] for d in dates)
+                    valuation_ok = any(actual[code][d]["valuation"] for d in dates)
+                    if market_ok:
+                        result["market_effective"] += 1
+                    if valuation_ok:
+                        result["valuation_effective"] += 1
+            elif state == "excluded":
+                result["excluded"] += 1
+            elif state == "unknown":
+                result["unknown"] += 1
+
+            result["per_code"][code] = {
+                "state": state,
+                "reason": reason,
+                "bars_in_range": len(dates),
+                "missing_count": len(missing),
+                "gap_windows": gaps,  # 已合并的连续缺口窗口
+            }
+
+        result["expected"] = len(codes) - result["excluded"] - result["unknown"]
+        if result["unknown"] > 0:
+            result["status"] = "unknown"  # 历史状态证据不足，不推断为完整
+        elif result["expected"] > 0 and result["effective"] >= result["expected"] and \
+                all(not c["gap_windows"] for c in result["per_code"].values()
+                    if c["state"] == "effective"):
+            result["status"] = "complete"
+        else:
+            result["status"] = "partial"
+        return result
 
     # ---------- generic helpers ----------
 

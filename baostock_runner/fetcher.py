@@ -324,21 +324,46 @@ class Fetcher:
             if self.budget_left() <= 0:
                 raise BudgetExhausted()
             for af in adjustflags:
-                self.gateway.daily_bars({
-                    "code": code,
-                    "fields": DAILY_FIELDS,
-                    "start_date": self.settings.fetch_daily_start_date,
-                    "end_date": latest,
-                    "frequency": "d",
-                    "adjustflag": af,
-                }, use_cache=False, priority=1)
-                # 真实请求成功后才计入下载预算（gateway 侧只计总 usage）。
-                self.storage.increment_download_usage()
+                # A-02：按缺口窗口补齐（头部/中间/尾部），不预生成全市场历史笛卡尔积。
+                # 用本地交易日历判断应覆盖日期，把缺口合并为连续请求窗口逐段请求。
+                trade_dates = self._trade_dates_in_range(
+                    self.settings.fetch_daily_start_date, latest)
+                coverage = self.storage.get_daily_coverage(
+                    [code], self.settings.fetch_daily_start_date, latest, af,
+                    trade_dates=trade_dates)
+                gaps = coverage["per_code"][code]["gap_windows"]
+                # 回退：本地交易日历缺失时（异常），按整个请求区间作为一个窗口补齐。
+                if not gaps and not trade_dates:
+                    gaps = [{"start": self.settings.fetch_daily_start_date,
+                             "end": latest, "days": 0}]
+                if gaps:
+                    for win in gaps:
+                        if self.budget_left() <= 0:
+                            raise BudgetExhausted()
+                        self.gateway.daily_bars({
+                            "code": code,
+                            "fields": DAILY_FIELDS,
+                            "start_date": win["start"],
+                            "end_date": win["end"],
+                            "frequency": "d",
+                            "adjustflag": af,
+                        }, use_cache=False, priority=1)
+                        self.storage.increment_download_usage()
+                # 无缺口时无需请求；仍记录 job（用于当日去重/断点续传）。
                 self.storage.job_upsert("daily_bars", f"{code}|{af}", "done")
             done += 1
             self._set_state(done=done)
         self._set_state(current=f"daily backfill batch done: {done} codes")
         return True
+
+    def _trade_dates_in_range(self, start_date: str, end_date: str) -> list[str]:
+        """读取本地交易日历在 [start, end] 内的交易日列表（用于覆盖检查）。"""
+        with self.storage._session() as db:
+            rows = db.execute(
+                "SELECT calendar_date FROM trade_calendar "
+                "WHERE is_trading_day=1 AND calendar_date BETWEEN ? AND ? ORDER BY calendar_date",
+                (start_date, end_date)).fetchall()
+        return [r[0] for r in rows]
 
     # ---------- financials backfill (按 code × year × quarter，倒序优先最新) ----------
 
