@@ -201,6 +201,23 @@ get_market_coverage()
 - 审计日志：`/data/baostock-audit.jsonl`。
 - 核心事实表：`daily_bars`（按日期/代码/频率/复权分列 + 索引，日线增量补尾部）、`financials`、`dividends`、`adjust_factors`、`index_constituents`、`stock_industry`、`trade_calendar`、`securities`。
 
+## A/B 阶段（2026-09 已实现）
+
+- **A-01 统一时间与日历推进**：业务日/每日预算按 `Asia/Shanghai` 划日，审计时间保存 UTC；
+  日历按覆盖终点触发补齐（可配置预拉窗口 `BAOSTOCK_CALENDAR_PRELOOK_DAYS`）；
+  日线当日检查默认从上海时间 18:00 开始（`BAOSTOCK_DAILY_CHECK_TIME` 可配置，仅表示开始尝试）；
+  盘前以最近已结束交易日为目标；切换预算日口径期间按新旧计数中较保守的已用量限制请求，不重置额度。
+- **A-02 日线覆盖、字段与强制刷新**：`preclose/tradestatus/isST/peTTM/pbMRQ/psTTM/pcfNcfTTM`
+  提升为可查询列（schema v2 迁移）；窄字段请求不覆盖旧值（字段级合并）；覆盖检查识别头部/中间/尾部
+  缺口并合并为连续请求窗口；`get_stock_daily_bars(force_refresh=True)` 同时绕过参数缓存与事实表短路；
+  覆盖结果区分 expected/effective/excluded/unknown，行情与估值字段分别统计。
+- **A-03 可重查任务与财务修订**：任务状态机 `pending/running/succeeded/waiting_data/retryable_failed/permanent_failed`
+  （schema v3）；空财报进入 `waiting_data` 按披露窗口重查（默认 24h）；最近两个已结束季度每日检查修订、
+  其余报告每 30 天检查；网络失败指数退避（60s 起、最长 1h）；财务数据与作业完成状态同事务提交；
+  进程重启回收过期 `running` 任务；分红/复权按检查窗口增量更新；旧 `done` 状态迁移为 `succeeded`。
+- **B-01 schema 版本与备份恢复**：`PRAGMA user_version` + 顺序迁移（新增表/列优先，幂等可重跑）；
+  未知更高版本启动时拒绝写入；SQLite Online Backup 一致性备份与隔离恢复，完整性/行数/关键字段对账。
+
 ## 后续开发方向与计划
 
 按"数据可信度优先 → 稳定性 → 可观测性 → 体验与扩展"推进：
