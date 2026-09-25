@@ -32,6 +32,8 @@ SUPPORTED_METHODS = {
     "query_operation_data", "query_dupont_data",
     "query_dividend_data", "query_adjust_factor",
     "query_hs300_stocks", "query_sz50_stocks", "query_zz500_stocks",
+    # C-01: 按日批量接口（全 A 股某日行情）。仅允许白名单方法，不增加任意远端入口。
+    "query_daily_history_k_AStock",
 }
 
 
