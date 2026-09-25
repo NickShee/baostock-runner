@@ -224,6 +224,10 @@ get_market_coverage()
   其余报告每 30 天检查；网络失败指数退避（60s 起、最长 1h）；财务数据与作业完成状态同事务提交；
   进程重启回收过期 `running` 任务；分红/复权按检查窗口增量更新；旧 `done` 状态迁移为 `succeeded`。
 - **B-02 请求计数与运维**：Job 带 `origin/request_id/deadline`；队列默认容量 256，前台/后台默认期限 120/300 秒；排队过期请求跳过，执行中调用方超时不声称取消 SDK；失败、重试、登录验证均按远端尝试前计数，缓存命中免费；后台预算独立封顶；等待老化避免饥饿；关停终结未执行任务；结构化 JSONL 审计按大小轮转，并提供 Gateway 健康快照（HTTP 挂载在 E-02）。
+- **A-04 缓存有效期与本地读取**：参数缓存分类型 TTL（空结果/近期行情 15 分钟、历史行情 7 天、财务成分 1 天、基本行业 7 天，schema v4）；过期缓存标记 stale 重查，空结果不会永久命中；上游故障时返回本地 stale 数据并标记远端错误；旧无分类缓存到期失效不清空事实表；强制刷新（`use_cache=False`）确实触发远端。
+- **C-01 按日批量接口实验工具**：类型化 Adapter 仅允许 `query_daily_history_k_AStock(date)`（全 A 股某日行情），不暴露任意远端方法入口；实验记录固定版本/签名/原始响应/字段映射/证券差集/性能报告，状态 `supported/partial/unsupported/unverified`（无真实访问必须 `unverified`）；真实实验只能走现有唯一 worker（EXT-02）。
+- **D-01 最小标准模型与版本留存**：securities 增加 `asset_type/source`（schema v5），保留 code 兼容标识；`security_versions` 观察版本可追溯/重建；`data_batches` 采集批次记录；financials 增加 `pub_date/stat_date` 标准列；字段映射集中在 `standard.py`；历史未知来源标记 unknown 不补造时间。
+- **C-02 每日主采集模式**：`fetch_mode` 支持 `per_stock`（默认）/`daily_batch`；`daily_batch` 按最近交易日窗口调批量接口，标准化后校验再提交（截断/重复键/未解释缺失不得标整日完成），缺估值字段追加补充任务；接口不可用降级逐股保留降级状态；未通过真实实验前仅隔离验证，不切换生产默认。
 - **B-01 schema 版本与备份恢复**：`PRAGMA user_version` + 顺序迁移（新增表/列优先，幂等可重跑）；
   未知更高版本启动时拒绝写入；SQLite Online Backup 一致性备份与隔离恢复，完整性/行数/关键字段对账。
 
