@@ -58,7 +58,8 @@ class BaoStockGateway:
         # A-01: 可注入时钟（业务日 Asia/Shanghai、审计 UTC），传给 Storage/Fetcher。
         # 测试可传假时钟推进日期/预算日；默认使用真实时钟。
         self.clock: Clock = clock or Clock()
-        self.storage = Storage(self.settings.db_path, self.settings.log_path, clock=self.clock)
+        self.storage = Storage(self.settings.db_path, self.settings.log_path,
+                               clock=self.clock, settings=self.settings)
         # 优先级队列：MCP 查询（priority=0）总排到 fetcher（priority=1）前面；
         # 同优先级用递增序号保证 FIFO，不比较 Job 对象本身。
         self.jobs: queue.PriorityQueue = queue.PriorityQueue(maxsize=max(1, self.settings.request_queue_capacity))
@@ -130,9 +131,11 @@ class BaoStockGateway:
         key = hashlib.sha256(json.dumps({"method": method, "params": params}, sort_keys=True).encode()).hexdigest()
         if use_cache:
             cached = self.storage.get_cache(key)
-            if cached is not None:
-                self.storage.audit({"interface": method, **params, "cache_hit": True, "request_count_today": self.storage.usage_today_conservative(), "error_code": "0", "origin": origin, "request_id": request_id, "status": "cache_hit"}, self.settings.audit_log_max_bytes)
-                return {"data": cached, "cache_hit": True, "request_count_today": self.storage.usage_today_conservative(), "request_id": request_id}
+            if cached is not None and not cached["stale"]:
+                self.storage.audit({"interface": method, **params, "cache_hit": True, "request_count_today": self.storage.usage_today_conservative(), "error_code": "0", "origin": origin, "request_id": request_id, "status": "cache_hit", "stale": False}, self.settings.audit_log_max_bytes)
+                return {"data": cached["payload"], "cache_hit": True,
+                        "request_count_today": self.storage.usage_today_conservative(),
+                        "request_id": request_id, "stale": False}
         result: queue.Queue = queue.Queue(maxsize=1)
         job = Job(method, params, result, use_cache, priority, origin, request_id, deadline, time.monotonic())
         try:
@@ -151,6 +154,26 @@ class BaoStockGateway:
                                self.settings.audit_log_max_bytes)
             raise TimeoutError(f"BaoStock request {request_id} exceeded its deadline; running SDK call may continue") from exc
         if not ok:
+            # A-04: 上游故障（重试耗尽/重连失败/预算不足等）时，若存在本地缓存
+            # （含过期 stale），返回本地数据并标记 stale 与远端错误，不阻塞本地读取。
+            exc = value
+            if use_cache:
+                cached = self.storage.get_cache(key)
+                if cached is not None:
+                    self.storage.audit({"interface": method, **params, "origin": origin,
+                                        "request_id": request_id, "status": "stale_fallback",
+                                        "error_type": type(exc).__name__,
+                                        "error": str(exc)[:1000], "stale": cached["stale"]},
+                                       self.settings.audit_log_max_bytes)
+                    return {
+                        "data": cached["payload"],
+                        "cache_hit": True,
+                        "request_count_today": self.storage.usage_today_conservative(),
+                        "request_id": request_id,
+                        "stale": True,
+                        "upstream_error": str(exc),
+                        "upstream_error_type": type(exc).__name__,
+                    }
             raise value
         value["request_id"] = request_id
         return value
@@ -493,13 +516,32 @@ class BaoStockGateway:
             count = self.storage.usage_today_conservative()
         payload = {"data": rows, "cache_hit": False, "request_count_today": count}
         if use_cache:
-            self.storage.put_cache(self._key(method, p), rows)
+            # A-04: 分类型 TTL 写入——空结果单独短期有效；日线按区间远近区分。
+            is_empty = not rows
+            recent = self._is_recent_quote(method, p)
+            self.storage.put_cache(self._key(method, p), rows, method=method,
+                                   is_empty=is_empty, recent=recent)
         job = self._active_job
         self.storage.audit({"interface": method, **p, "cache_hit": False, "request_count_today": count,
                             "error_code": "0", "origin": job.origin if job else "maintenance",
                             "request_id": job.request_id if job else "gateway-session", "status": "query_succeeded"},
                            self.settings.audit_log_max_bytes)
         return payload
+
+    def _is_recent_quote(self, method: str, p: dict[str, Any]) -> bool:
+        """日线查询是否属于"近期"（区间终点距今 <= 配置窗口），用于 TTL 分类。"""
+        if method != "query_history_k_data_plus":
+            return False
+        end = p.get("end_date", "")
+        if not end:
+            return False
+        try:
+            from datetime import datetime as _dt
+            end_dt = _dt.strptime(end, "%Y-%m-%d").date()
+            today = self.storage.clock.business_date()
+            return (today - end_dt).days <= self.settings.cache_recent_quotes_window_days
+        except ValueError:
+            return False
 
     def _key(self, method, params):
         return hashlib.sha256(json.dumps({"method": method, "params": params}, sort_keys=True).encode()).hexdigest()

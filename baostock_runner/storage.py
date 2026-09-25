@@ -8,10 +8,10 @@ from typing import Any, Callable
 
 from .timeutil import Clock
 
-# B-01: schema 版本。当前最新版本为 3。
+# B-01: schema 版本。当前最新版本为 4。
 # 迁移采用顺序执行：旧库（user_version < SCHEMA_VERSION）逐版本升级；
 # 未知更高版本（user_version > SCHEMA_VERSION）启动时拒绝写入，防止旧代码破坏新库。
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 # A-03: 任务状态机。
 JOB_PENDING = "pending"
@@ -138,6 +138,14 @@ MIGRATIONS: dict[int, list[Any]] = {
         # 旧 'done' 状态迁移为 'succeeded'（A-03：保留完成语义但允许后续按规则刷新）。
         lambda db: _migrate_legacy_done(db),
     ],
+    # A-04: cache 表增加 method/expires_at/is_empty 列，支持分类型 TTL 与 stale 判定。
+    4: [
+        lambda db: _add_column_if_missing(db, "cache", "method", "TEXT"),
+        lambda db: _add_column_if_missing(db, "cache", "expires_at", "TEXT"),
+        lambda db: _add_column_if_missing(db, "cache", "is_empty", "INTEGER"),
+        # 旧无分类缓存到期失效：迁移前 cache 行无 expires_at（NULL），
+        # 读缓存时视为已过期（A-04：不清空事实表，仅停止命中）。
+    ],
 }
 
 
@@ -220,8 +228,12 @@ class Storage:
     JOB_RETRYABLE_FAILED = JOB_RETRYABLE_FAILED
     JOB_PERMANENT_FAILED = JOB_PERMANENT_FAILED
 
-    def __init__(self, db_path: str, log_path: str, clock: Clock | None = None):
+    def __init__(self, db_path: str, log_path: str, clock: Clock | None = None,
+                 settings: Any | None = None):
         self.db_path, self.log_path = db_path, log_path
+        # A-04: 配置（缓存 TTL 等）。默认 Settings() 保持向后兼容。
+        from .config import Settings
+        self.settings = settings or Settings()
         # A-01: 可注入时钟。业务日/预算计数按 Asia/Shanghai 划日；审计时间 UTC。
         self.clock = clock or Clock()
         self._audit_lock = threading.Lock()
@@ -438,15 +450,86 @@ class Storage:
         """当前库完整性检查 + 行数统计（用于备份前后对账）。"""
         return self.verify_backup(self.db_path)
 
-    def get_cache(self, key: str):
-        with self._session() as db:
-            row = db.execute("SELECT payload FROM cache WHERE cache_key=?", (key,)).fetchone()
-        return json.loads(row[0]) if row else None
+    # ---------- A-04: 参数缓存（分类型 TTL + 过期/stale 判定） ----------
 
-    def put_cache(self, key: str, value: Any):
-        now = self.clock.now_utc().isoformat()
+    FINANCIAL_METHODS = {
+        "query_profit_data", "query_growth_data", "query_balance_data",
+        "query_cash_flow_data", "query_operation_data", "query_dupont_data",
+    }
+    BASIC_METHODS = {"query_stock_basic", "query_stock_industry"}
+    QUOTE_METHODS = {"query_history_k_data_plus"}
+
+    def cache_ttl_for(self, method: str, is_empty: bool = False,
+                      recent: bool = False) -> int:
+        """按方法类型与结果性质返回 TTL（秒）。"""
+        if is_empty:
+            return self.settings.cache_ttl_empty_seconds
+        if method in self.FINANCIAL_METHODS or method in {
+                "query_hs300_stocks", "query_sz50_stocks", "query_zz500_stocks"}:
+            return self.settings.cache_ttl_financial_seconds
+        if method in self.BASIC_METHODS:
+            return self.settings.cache_ttl_basic_seconds
+        if method in self.QUOTE_METHODS:
+            return self.settings.cache_ttl_recent_quotes_seconds if recent \
+                else self.settings.cache_ttl_historical_quotes_seconds
+        return self.settings.cache_ttl_default_seconds
+
+    def put_cache(self, key: str, value: Any, method: str = "",
+                  is_empty: bool = False, ttl_seconds: int | None = None,
+                  recent: bool = False):
+        """写入缓存并记录 method/过期时间；ttl_seconds 为空时按 method 分类判定。"""
+        now = self.clock.now_utc()
+        ttl = self.cache_ttl_for(method, is_empty, recent) if ttl_seconds is None else ttl_seconds
+        expires = (now.timestamp() + ttl)
+        from datetime import datetime as _dt
+        expires_iso = _dt.fromtimestamp(expires, tz=timezone.utc).isoformat()
         with self._session() as db:
-            db.execute("INSERT OR REPLACE INTO cache VALUES (?, ?, ?)", (key, json.dumps(value, ensure_ascii=False), now))
+            db.execute(
+                "INSERT OR REPLACE INTO cache(cache_key, payload, created_at, method, expires_at, is_empty)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
+                (key, json.dumps(value, ensure_ascii=False), now.isoformat(),
+                 method, expires_iso, 1 if is_empty else 0))
+
+    def get_cache(self, key: str):
+        """读取缓存。
+
+        返回 dict：{payload, method, expires_at, is_empty, stale}。
+        - 不存在 → None。
+        - 已过期（expires_at < now）或旧无分类缓存（expires_at NULL）→ stale=True
+          （A-04：旧缓存到期失效，不清空事实表；上层可决定用 stale 还是重查）。
+        """
+        with self._session() as db:
+            row = db.execute(
+                "SELECT payload, created_at, method, expires_at, is_empty FROM cache WHERE cache_key=?",
+                (key,)).fetchone()
+        if row is None:
+            return None
+        payload, created_at, method, expires_at, is_empty = row
+        now_ts = self.clock.now_utc().timestamp()
+        stale = False
+        if expires_at is None:
+            # 旧无分类缓存：无过期时间，视为已过期（A-04 迁移前遗留）。
+            stale = True
+        else:
+            try:
+                from datetime import datetime as _dt
+                stale = _dt.fromisoformat(expires_at).timestamp() < now_ts
+            except ValueError:
+                stale = True
+        return {
+            "payload": json.loads(payload),
+            "method": method or "",
+            "expires_at": expires_at,
+            "is_empty": bool(is_empty),
+            "stale": stale,
+        }
+
+    def get_cache_meta(self, key: str) -> dict | None:
+        """仅返回缓存元信息（不解析 payload），用于本地优先判定。"""
+        info = self.get_cache(key)
+        if info is None:
+            return None
+        return {k: v for k, v in info.items() if k != "payload"}
 
     def audit(self, event: dict[str, Any], max_bytes: int = 20 * 1024 * 1024):
         event = {"timestamp": self.clock.now_utc().isoformat(), **event}

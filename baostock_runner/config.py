@@ -88,6 +88,22 @@ class Settings:
     background_fairness_wait_seconds: int = _int("BAOSTOCK_BACKGROUND_FAIRNESS_WAIT_SECONDS", 60)
     background_fairness_foreground_burst: int = _int("BAOSTOCK_BACKGROUND_FAIRNESS_FOREGROUND_BURST", 10)
     audit_log_max_bytes: int = _int("BAOSTOCK_AUDIT_LOG_MAX_BYTES", 20 * 1024 * 1024)
+    # --- A-04: 参数缓存 TTL（秒）---
+    # 空结果单独短期有效，避免永久命中。
+    cache_ttl_empty_seconds: int = _int("BAOSTOCK_CACHE_TTL_EMPTY_SECONDS", 15 * 60)
+    # 近期行情（日线区间包含最近 5 个自然日）短期有效。
+    cache_ttl_recent_quotes_seconds: int = _int("BAOSTOCK_CACHE_TTL_RECENT_QUOTES_SECONDS", 15 * 60)
+    # 历史行情（非近期）长周期有效。
+    cache_ttl_historical_quotes_seconds: int = _int("BAOSTOCK_CACHE_TTL_HISTORICAL_QUOTES_SECONDS", 7 * 86400)
+    # 财务与指数成分。
+    cache_ttl_financial_seconds: int = _int("BAOSTOCK_CACHE_TTL_FINANCIAL_SECONDS", 86400)
+    # 基本资料与行业。
+    cache_ttl_basic_seconds: int = _int("BAOSTOCK_CACHE_TTL_BASIC_SECONDS", 7 * 86400)
+    # 未分类（默认）。
+    cache_ttl_default_seconds: int = _int("BAOSTOCK_CACHE_TTL_DEFAULT_SECONDS", 86400)
+    # 近期行情判定窗口（天）：日线区间终点距今 <= 该值视为"近期"。
+    cache_recent_quotes_window_days: int = _int("BAOSTOCK_CACHE_RECENT_QUOTES_WINDOW_DAYS", 5)
+    # 旧无分类缓存（A-04 迁移前的 cache 行）在启动后视为已过期，不清空事实表。
     # --- worker heartbeat / watchdog ---
     # gateway worker 心跳看门狗：worker 卡死（如 baostock rs.next() 在半开连接下死循环）
     # 且心跳停滞超过阈值时，主动终止进程，由容器 restart 策略自动拉起。
