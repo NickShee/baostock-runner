@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 import hashlib
+import heapq
 import itertools
 import json
 import os
@@ -7,6 +8,7 @@ import queue
 import socket
 import threading
 import time
+import uuid
 from typing import Any
 
 from .config import Settings
@@ -43,6 +45,10 @@ class Job:
     # 队列优先级：0 = MCP 查询（最高，插队）；1 = 后台 fetcher（让位）。
     # worker 始终优先取优先级最小的 Job。
     priority: int = 0
+    origin: str = "mcp"
+    request_id: str = ""
+    deadline: float = 0.0
+    enqueued_at: float = 0.0
 
 
 class BaoStockGateway:
@@ -55,8 +61,12 @@ class BaoStockGateway:
         self.storage = Storage(self.settings.db_path, self.settings.log_path, clock=self.clock)
         # 优先级队列：MCP 查询（priority=0）总排到 fetcher（priority=1）前面；
         # 同优先级用递增序号保证 FIFO，不比较 Job 对象本身。
-        self.jobs: queue.PriorityQueue = queue.PriorityQueue()
+        self.jobs: queue.PriorityQueue = queue.PriorityQueue(maxsize=max(1, self.settings.request_queue_capacity))
         self._seq = itertools.count()
+        self._closed = False
+        self._queue_lock = threading.Lock()
+        self._foreground_since_background = 0
+        self._active_job: Job | None = None
         self.stop_event = threading.Event()
         self.breaker = threading.Event()
         self.ready = threading.Event()
@@ -80,15 +90,39 @@ class BaoStockGateway:
             self.watchdog.start()
 
     def close(self):
-        self.stop_event.set()
-        self.jobs.put((-1, next(self._seq), None))
+        with self._queue_lock:
+            if self._closed:
+                return
+            self._closed = True
+            self.stop_event.set()
+            while True:
+                try:
+                    _, _, job = self.jobs.get_nowait()
+                except queue.Empty:
+                    break
+                if job is not None:
+                    self._finish(job, False, RuntimeError("BaoStock gateway is shutting down"), "shutdown")
+            self.jobs.put_nowait((-1, next(self._seq), None))
         self.worker.join(timeout=10)
         if self.watchdog is not None:
             self.watchdog.join(timeout=2)
 
-    def call(self, method: str, params: dict[str, Any], use_cache: bool = True, priority: int = 0) -> dict[str, Any]:
-        if not self.ready.wait(timeout=15):
-            raise RuntimeError("BaoStock worker did not become ready")
+    def call(self, method: str, params: dict[str, Any], use_cache: bool = True, priority: int = 0,
+             origin: str | None = None, request_id: str | None = None,
+             deadline_seconds: float | None = None) -> dict[str, Any]:
+        origin = origin or ("fetcher" if priority > 0 else "mcp")
+        if origin not in {"mcp", "dashboard", "fetcher", "maintenance"}:
+            raise ValueError("origin must be mcp, dashboard, fetcher, or maintenance")
+        priority = 1 if origin == "fetcher" else 0
+        request_id = request_id or uuid.uuid4().hex
+        default_deadline = (self.settings.background_request_deadline_seconds if origin == "fetcher"
+                            else self.settings.foreground_request_deadline_seconds)
+        request_deadline_seconds = max(0.001, deadline_seconds if deadline_seconds is not None else default_deadline)
+        deadline = time.monotonic() + request_deadline_seconds
+        if self._closed:
+            raise RuntimeError("BaoStock gateway is shutting down")
+        if not self.ready.wait(timeout=min(15, max(0.001, deadline - time.monotonic()))):
+            raise TimeoutError("BaoStock worker did not become ready before the request deadline")
         if self.startup_error is not None:
             raise self.startup_error
         if self.breaker.is_set():
@@ -97,17 +131,67 @@ class BaoStockGateway:
         if use_cache:
             cached = self.storage.get_cache(key)
             if cached is not None:
-                self.storage.audit({"interface": method, **params, "cache_hit": True, "request_count_today": self.storage.usage_today(), "error_code": "0"})
-                return {"data": cached, "cache_hit": True, "request_count_today": self.storage.usage_today()}
+                self.storage.audit({"interface": method, **params, "cache_hit": True, "request_count_today": self.storage.usage_today_conservative(), "error_code": "0", "origin": origin, "request_id": request_id, "status": "cache_hit"}, self.settings.audit_log_max_bytes)
+                return {"data": cached, "cache_hit": True, "request_count_today": self.storage.usage_today_conservative(), "request_id": request_id}
         result: queue.Queue = queue.Queue(maxsize=1)
-        self.jobs.put((priority, next(self._seq), Job(method, params, result, use_cache, priority)))
-        ok, value = result.get()
+        job = Job(method, params, result, use_cache, priority, origin, request_id, deadline, time.monotonic())
+        try:
+            with self._queue_lock:
+                if self._closed:
+                    raise RuntimeError("BaoStock gateway is shutting down")
+                self.jobs.put_nowait((priority, next(self._seq), job))
+        except queue.Full as exc:
+            self._finish(job, False, RuntimeError("BaoStock request queue is full"), "queue_full")
+            raise RuntimeError("BaoStock request queue is full") from exc
+        try:
+            ok, value = result.get(timeout=max(0.001, deadline - time.monotonic()))
+        except queue.Empty as exc:
+            self.storage.audit({"interface": method, **params, "origin": origin, "request_id": request_id,
+                                "status": "caller_timeout", "deadline_seconds": request_deadline_seconds},
+                               self.settings.audit_log_max_bytes)
+            raise TimeoutError(f"BaoStock request {request_id} exceeded its deadline; running SDK call may continue") from exc
         if not ok:
             raise value
+        value["request_id"] = request_id
         return value
 
+    def _finish(self, job: Job, ok: bool, value: Any, status: str):
+        event = {"interface": job.method, **job.params, "origin": job.origin, "request_id": job.request_id,
+                 "status": status, "error_type": None if ok else type(value).__name__,
+                 "error": None if ok else str(value)[:1000]}
+        self.storage.audit(event, self.settings.audit_log_max_bytes)
+        try:
+            job.result.put_nowait((ok, value))
+        except queue.Full:
+            pass
+
+    def _take_job(self):
+        """Priority dequeue with bounded starvation for long-waiting fetcher jobs."""
+        item = self.jobs.get(timeout=0.2)
+        _, _, first = item
+        if first is None or first.priority > 0:
+            if first is not None:
+                self._foreground_since_background = 0
+            return first
+        if self._foreground_since_background < max(1, self.settings.background_fairness_foreground_burst):
+            self._foreground_since_background += 1
+            return first
+        cutoff = time.monotonic() - self.settings.background_fairness_wait_seconds
+        with self.jobs.mutex:
+            eligible = [(entry[2].enqueued_at, index, entry) for index, entry in enumerate(self.jobs.queue)
+                        if entry[2] is not None and entry[2].origin == "fetcher" and entry[2].enqueued_at <= cutoff]
+            if not eligible:
+                return first
+            _, index, selected = min(eligible)
+            self.jobs.queue[index] = self.jobs.queue[-1]
+            self.jobs.queue.pop()
+            self.jobs.queue.append(item)
+            heapq.heapify(self.jobs.queue)
+            self._foreground_since_background = 0
+            return selected[2]
+
     def daily_bars(self, params: dict[str, Any], use_cache: bool = True, priority: int = 0,
-                   force_refresh: bool = False) -> dict[str, Any]:
+                   force_refresh: bool = False, origin: str | None = None) -> dict[str, Any]:
         """Read local daily bars and fetch missing ranges from BaoStock.
 
         A-02：force_refresh=True 时同时绕过参数缓存（use_cache 视为 False）与
@@ -130,7 +214,7 @@ class BaoStockGateway:
         else:
             query_params = None
         if query_params is not None:
-            result = self.call("query_history_k_data_plus", query_params, use_cache=use_cache, priority=priority)
+            result = self.call("query_history_k_data_plus", query_params, use_cache=use_cache, priority=priority, origin=origin)
             new_rows = result["data"]
             # merge=True：窄字段/强制刷新不覆盖旧字段值（A-02 验收）。
             self.storage.put_daily_bars(code, frequency, adjustflag, new_rows, merge=True)
@@ -147,7 +231,7 @@ class BaoStockGateway:
             "cache_hit": not fetched,
             "incremental": True,
             "force_refresh": force_refresh,
-            "request_count_today": self.storage.usage_today(),
+            "request_count_today": self.storage.usage_today_conservative(),
         }
 
     def _worker(self):
@@ -159,6 +243,7 @@ class BaoStockGateway:
                     raise RuntimeError("BAOSTOCK_USER_ID and BAOSTOCK_PASSWORD must be provided together")
                 import baostock as bs_module
                 bs = bs_module
+                self._record_attempt("session_login", {}, "login")
                 login = (
                     bs.login(user_id=self.settings.user_id, password=self.settings.password)
                     if self.settings.user_id
@@ -170,30 +255,49 @@ class BaoStockGateway:
                     raise RuntimeError(f"BaoStock login failed: {login.error_code} {login.error_msg}")
                 logged_in = True
                 self.last_activity = time.monotonic()
+                if self.settings.verify_after_login:
+                    self._record_attempt("query_stock_basic", {"code": "sh.000001"}, "login_verification")
+                    verification = bs.query_stock_basic(code="sh.000001")
+                    if verification.error_code != "0":
+                        raise RuntimeError(f"BaoStock post-login verification failed: {verification.error_code} {verification.error_msg}")
             self.ready.set()
-            while not self.stop_event.is_set():
-                _, _, job = self.jobs.get()
+            while True:
+                try:
+                    job = self._take_job()
+                except queue.Empty:
+                    if self.stop_event.is_set():
+                        break
+                    continue
                 if job is None:
                     break
+                if time.monotonic() >= job.deadline:
+                    self._finish(job, False, TimeoutError("BaoStock request expired while queued"), "expired")
+                    continue
                 self._busy = True
+                self._active_job = job
                 self._beat()
                 try:
                     value = self._execute_robust(bs, job.method, job.params, job.use_cache)
-                    job.result.put((True, value))
+                    self._finish(job, True, value, "succeeded")
                 except Exception as exc:
-                    job.result.put((False, exc))
+                    self._finish(job, False, exc, "failed")
                 finally:
+                    self._active_job = None
                     self._busy = False
         except Exception as exc:
             self.startup_error = exc
             self.ready.set()
+            self.storage.audit({"interface": "gateway_startup", "origin": "maintenance",
+                                "request_id": "gateway-session", "status": "failed",
+                                "error_type": type(exc).__name__, "error": str(exc)[:1000]},
+                               self.settings.audit_log_max_bytes)
             while True:
                 try:
                     _, _, job = self.jobs.get_nowait()
                 except queue.Empty:
                     break
                 if job is not None:
-                    job.result.put((False, exc))
+                    self._finish(job, False, exc, "startup_failed")
         finally:
             if logged_in and bs is not None:
                 bs.logout()
@@ -248,6 +352,7 @@ class BaoStockGateway:
             except Exception:
                 pass
             time.sleep(1)
+            self._record_attempt("session_login", {}, "relogin")
             login = (
                 bs.login(user_id=self.settings.user_id, password=self.settings.password)
                 if self.settings.user_id
@@ -258,10 +363,40 @@ class BaoStockGateway:
                     self.breaker.set()
                 raise RuntimeError(f"BaoStock re-login failed: {login.error_code} {login.error_msg}")
             if self.settings.verify_after_login:
+                self._record_attempt("query_stock_basic", {"code": "sh.000001"}, "login_verification")
                 rs = bs.query_stock_basic(code="sh.000001")
                 if rs.error_code != "0":
                     raise RuntimeError(f"BaoStock post-login verification failed: {rs.error_code} {rs.error_msg}")
             self.last_activity = time.monotonic()
+
+    def _record_attempt(self, method: str, params: dict[str, Any], operation: str = "query"):
+        job = self._active_job
+        origin = job.origin if job else "maintenance"
+        request_id = job.request_id if job else "gateway-session"
+        total_limit = self.settings.daily_hard_limit
+        background_limit = max(0, min(total_limit, int(total_limit * self.settings.fetch_budget_ratio)))
+        try:
+            total, background = self.storage.reserve_request(origin, total_limit, background_limit)
+        except Exception as exc:
+            self.storage.audit({"interface": method, **params, "origin": origin, "request_id": request_id,
+                                "operation": operation, "status": "attempt_rejected", "error_type": type(exc).__name__,
+                                "error": str(exc)[:1000]}, self.settings.audit_log_max_bytes)
+            raise
+        self.storage.audit({"interface": method, **params, "origin": origin, "request_id": request_id,
+                            "operation": operation, "status": "attempt", "request_count_today": total,
+                            "background_request_count_today": background}, self.settings.audit_log_max_bytes)
+
+    def health_status(self) -> dict[str, Any]:
+        return {
+            "healthy": self.ready.is_set() and self.startup_error is None and self.worker.is_alive(),
+            "ready": self.ready.is_set() and self.startup_error is None and not self.breaker.is_set(),
+            "worker_alive": self.worker.is_alive(),
+            "circuit_breaker_open": self.breaker.is_set(),
+            "queue_length": self.jobs.qsize(),
+            "queue_capacity": self.jobs.maxsize,
+            "busy": self._busy,
+            "closed": self._closed,
+        }
 
     def _execute_robust(self, bs, method: str, p: dict[str, Any], use_cache: bool = True):
         """健壮执行路径：先保证会话新鲜，失败后视类型重连一轮再试。"""
@@ -285,9 +420,9 @@ class BaoStockGateway:
             return self._execute(bs, method, p, use_cache)
 
     def _execute(self, bs, method: str, p: dict[str, Any], use_cache: bool = True):
-        if self.storage.usage_today_conservative() >= self.settings.daily_hard_limit:
-            raise RuntimeError("Daily BaoStock request hard limit reached")
         if self.settings.offline:
+            self._record_attempt(method, p, "offline_simulation")
+            count = self.storage.usage_today_conservative()
             fields = [field.strip() for field in p.get("fields", "date,code").split(",")]
             # 离线模拟行：code 用代码、date 用 start_date、其余字段用合法数值，
             # 避免日期字符串被 _number 转浮点失败（A-02 字段提升测试依赖）。
@@ -300,7 +435,6 @@ class BaoStockGateway:
                 else:
                     row[field] = "10.0"
             rows = [row]
-            count = self.storage.increment_usage()
         else:
             time.sleep(self.settings.min_interval_seconds)
             fn = getattr(bs, method, None)
@@ -309,12 +443,30 @@ class BaoStockGateway:
             rs = None
             attempts = self.settings.max_retries + 1
             for attempt in range(attempts):
-                rs = fn(**p)
+                self._record_attempt(method, p, f"query_attempt_{attempt + 1}")
+                try:
+                    rs = fn(**p)
+                except Exception as exc:
+                    self.storage.audit({"interface": method, **p,
+                                        "origin": self._active_job.origin if self._active_job else "maintenance",
+                                        "request_id": self._active_job.request_id if self._active_job else "gateway-session",
+                                        "operation": f"query_attempt_{attempt + 1}", "status": "exception",
+                                        "error_type": type(exc).__name__, "error": str(exc)[:1000]}, self.settings.audit_log_max_bytes)
+                    if not isinstance(exc, RECONNECTABLE_NETWORK_EXC) or attempt + 1 == attempts:
+                        raise
+                    delay = self.settings.retry_delays[min(attempt, len(self.settings.retry_delays) - 1)] if self.settings.retry_delays else 5
+                    time.sleep(delay)
+                    continue
                 if rs.error_code == "0":
                     break
                 if rs.error_code == BLACKLIST_CODE:
                     self.breaker.set()
                     raise RuntimeError(f"BaoStock query failed: {rs.error_code} {rs.error_msg}")
+                self.storage.audit({"interface": method, **p,
+                                    "origin": self._active_job.origin if self._active_job else "maintenance",
+                                    "request_id": self._active_job.request_id if self._active_job else "gateway-session",
+                                    "operation": f"query_attempt_{attempt + 1}", "status": "upstream_error",
+                                    "error_code": rs.error_code, "error": str(rs.error_msg)[:1000]}, self.settings.audit_log_max_bytes)
                 if attempt + 1 == attempts:
                     raise ReconnectableFailure(f"BaoStock query failed after {attempts} attempts: {rs.error_code} {rs.error_msg}")
                 delay = self.settings.retry_delays[min(attempt, len(self.settings.retry_delays) - 1)] if self.settings.retry_delays else 5
@@ -338,11 +490,15 @@ class BaoStockGateway:
                     )
                 if len(rows) % 100 == 0:
                     self._beat()
-            count = self.storage.increment_usage()
+            count = self.storage.usage_today_conservative()
         payload = {"data": rows, "cache_hit": False, "request_count_today": count}
         if use_cache:
             self.storage.put_cache(self._key(method, p), rows)
-        self.storage.audit({"interface": method, **p, "cache_hit": False, "request_count_today": count, "error_code": "0"})
+        job = self._active_job
+        self.storage.audit({"interface": method, **p, "cache_hit": False, "request_count_today": count,
+                            "error_code": "0", "origin": job.origin if job else "maintenance",
+                            "request_id": job.request_id if job else "gateway-session", "status": "query_succeeded"},
+                           self.settings.audit_log_max_bytes)
         return payload
 
     def _key(self, method, params):

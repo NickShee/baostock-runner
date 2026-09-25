@@ -36,12 +36,13 @@
 
 数据流：`BaoStock → fetcher/gateway（单队列）→ SQLite 事实表 → MCP 读取工具命中本地`。审计日志 `baostock-audit.jsonl` 记录每次请求。
 
-### 优先级队列（MCP 查询插队）
+### 优先级队列（前台优先并防止后台饥饿）
 
-`gateway.jobs` 使用 `queue.PriorityQueue`：**MCP 查询（priority=0）总排到后台 fetcher（priority=1）前面**，同优先级按入队顺序 FIFO。
+`gateway.jobs` 使用有界 `queue.PriorityQueue`：默认 MCP/dashboard/maintenance 请求优先于后台 fetcher；后台请求等待超过 60 秒后，每处理 10 个前台请求会放行一个后台请求，避免持续前台流量让回填永久饥饿。同优先级按入队顺序 FIFO。
 
 - fetcher 每个请求标记 `priority=1`（`_bounded_call` / `daily_bars` 透传）。
-- worker 完成当前请求后优先处理 MCP 请求，再继续 fetcher——**MCP 实时查询不被后台回填阻塞**，无需暂停 fetcher 或把下载挪到闲时。
+- worker 完成当前请求后优先处理前台请求，再继续 fetcher；排队超过请求期限的任务会跳过。调用方执行中超时只停止等待，不能取消 BaoStock SDK 内部调用；worker 看门狗继续负责卡死恢复。
+- 每个远端尝试（含失败、重试、登录及连接验证）在发起前原子计入总预算；后台调用另受独立比例上限约束。缓存命中不扣预算。请求审计包含 `origin`、`request_id`、状态与失败类型，JSONL 达到配置大小后按时间戳轮转。
 - 生产实测：财务回填进行中查询 2013 年历史日线（需拉 BaoStock）耗时 4.3s 返回；同场景优化前排队 218s 未完成。
 
 ## 后台分批次下载器（P1）
@@ -62,9 +63,15 @@
 | 环境变量 | 默认值 | 说明 |
 |---|---|---|
 | `BAOSTOCK_FETCH_BUDGET_RATIO` | `0.67` | fetcher 占每日总预算 `BAOSTOCK_DAILY_HARD_LIMIT` 的比例（2/3） |
+| `BAOSTOCK_REQUEST_QUEUE_CAPACITY` | `256` | Gateway 等待队列容量；满队列快速失败 |
+| `BAOSTOCK_FOREGROUND_DEADLINE_SECONDS` | `120` | MCP/dashboard/maintenance 请求期限 |
+| `BAOSTOCK_BACKGROUND_DEADLINE_SECONDS` | `300` | fetcher 请求期限 |
+| `BAOSTOCK_BACKGROUND_FAIRNESS_WAIT_SECONDS` | `60` | 后台请求达到此等待时间后启用老化放行 |
+| `BAOSTOCK_BACKGROUND_FAIRNESS_FOREGROUND_BURST` | `10` | 每处理这么多个前台请求，最多放行一个已老化后台请求 |
+| `BAOSTOCK_AUDIT_LOG_MAX_BYTES` | `20971520` | JSONL 审计单文件轮转阈值；0 关闭轮转 |
 | `BAOSTOCK_FETCH_PAUSE_SLEEP_SECONDS` | `600` | 预算耗尽后的暂停检查间隔；按天计数，跨天自动恢复 |
 
-fetcher 使用独立的 `download_usage` 计数，硬顶 = `hard_limit × ratio`；达到即**软暂停**（不抛错、不抢占），MCP 至少保留 `hard_limit × (1-ratio)`（默认 1/3）额度。`get_backfill_status` 返回预算拆分与各数据集任务统计。
+fetcher 使用独立的 `download_usage` 计数，硬顶 = `hard_limit × ratio`；Gateway 在每次远端尝试前强制预留总预算及后台预算，fetcher 调度器发现预算用尽后软暂停。MCP 至少保留 `hard_limit × (1-ratio)`（默认 1/3）额度。`get_backfill_status` 返回预算拆分与各数据集任务统计。
 
 ### 全部 fetcher 环境变量
 
@@ -199,6 +206,7 @@ get_market_coverage()
 
 - 数据库：`/data/baostock.sqlite3`（bind mount 到 NAS SSD，如 `/volume3/docker-data/baostock-runner/data/`），当前体量约 350MB+。
 - 审计日志：`/data/baostock-audit.jsonl`。
+- Gateway 状态包含 worker 存活/就绪、熔断、队列容量与忙闲状态；`gateway_status()` 对外提供状态快照，HTTP 健康路由在 E-02 接入。
 - 核心事实表：`daily_bars`（按日期/代码/频率/复权分列 + 索引，日线增量补尾部）、`financials`、`dividends`、`adjust_factors`、`index_constituents`、`stock_industry`、`trade_calendar`、`securities`。
 
 ## A/B 阶段（2026-09 已实现）
@@ -215,6 +223,7 @@ get_market_coverage()
   （schema v3）；空财报进入 `waiting_data` 按披露窗口重查（默认 24h）；最近两个已结束季度每日检查修订、
   其余报告每 30 天检查；网络失败指数退避（60s 起、最长 1h）；财务数据与作业完成状态同事务提交；
   进程重启回收过期 `running` 任务；分红/复权按检查窗口增量更新；旧 `done` 状态迁移为 `succeeded`。
+- **B-02 请求计数与运维**：Job 带 `origin/request_id/deadline`；队列默认容量 256，前台/后台默认期限 120/300 秒；排队过期请求跳过，执行中调用方超时不声称取消 SDK；失败、重试、登录验证均按远端尝试前计数，缓存命中免费；后台预算独立封顶；等待老化避免饥饿；关停终结未执行任务；结构化 JSONL 审计按大小轮转，并提供 Gateway 健康快照（HTTP 挂载在 E-02）。
 - **B-01 schema 版本与备份恢复**：`PRAGMA user_version` + 顺序迁移（新增表/列优先，幂等可重跑）；
   未知更高版本启动时拒绝写入；SQLite Online Backup 一致性备份与隔离恢复，完整性/行数/关键字段对账。
 

@@ -1,6 +1,7 @@
 import json
 import os
 import sqlite3
+import threading
 from contextlib import contextmanager
 from datetime import date, datetime, timezone
 from typing import Any, Callable
@@ -223,6 +224,7 @@ class Storage:
         self.db_path, self.log_path = db_path, log_path
         # A-01: 可注入时钟。业务日/预算计数按 Asia/Shanghai 划日；审计时间 UTC。
         self.clock = clock or Clock()
+        self._audit_lock = threading.Lock()
         parent = os.path.dirname(db_path)
         if parent:
             os.makedirs(parent, exist_ok=True)
@@ -258,6 +260,32 @@ class Storage:
         with self._session() as db:
             db.execute("INSERT INTO usage(usage_date, request_count) VALUES (?, 1) ON CONFLICT(usage_date) DO UPDATE SET request_count=request_count+1", (today,))
             return db.execute("SELECT request_count FROM usage WHERE usage_date=?", (today,)).fetchone()[0]
+
+    def reserve_request(self, origin: str, total_limit: int, background_limit: int) -> tuple[int, int]:
+        """Atomically reserve one upstream attempt before calling BaoStock.
+
+        Failed responses and retries consume budget too. The background quota is
+        a ceiling over the total daily budget and is checked in the same write
+        transaction as the total counter.
+        """
+        today, legacy_day = self._business_day(), self._utc_day()
+        with self._session() as db:
+            db.execute("BEGIN IMMEDIATE")
+            def count(table: str) -> int:
+                vals = [db.execute(f"SELECT request_count FROM {table} WHERE usage_date=?", (d,)).fetchone() for d in {today, legacy_day}]
+                return max((row[0] for row in vals if row), default=0)
+            total = count("usage")
+            if total >= total_limit:
+                raise RuntimeError("Daily BaoStock request hard limit reached")
+            background = count("download_usage")
+            if origin == "fetcher" and background >= background_limit:
+                raise RuntimeError("Daily background BaoStock request budget reached")
+            db.execute("INSERT INTO usage(usage_date, request_count) VALUES (?, ?) ON CONFLICT(usage_date) DO UPDATE SET request_count=excluded.request_count", (today, total + 1))
+            total += 1
+            if origin == "fetcher":
+                db.execute("INSERT INTO download_usage(usage_date, request_count) VALUES (?, ?) ON CONFLICT(usage_date) DO UPDATE SET request_count=excluded.request_count", (today, background + 1))
+                background += 1
+            return total, background
 
     def usage_today(self) -> int:
         """当前上海业务日已用量。"""
@@ -297,6 +325,10 @@ class Storage:
     def _connect(self):
         db = sqlite3.connect(self.db_path, timeout=30)
         db.execute("PRAGMA busy_timeout=30000")
+        # WAL 模式官方推荐组合：synchronous=NORMAL（每次 commit 不强制 fsync）。
+        # __init__ 只在初始化连接设置过；若这里遗漏，每次 _session 新连接会回落到
+        # 默认 FULL，导致每次 commit 都 fsync（慢存储上每次 1s+，B-02 高频预算计数受影响）。
+        db.execute("PRAGMA synchronous=NORMAL")
         return db
 
     @contextmanager
@@ -416,10 +448,23 @@ class Storage:
         with self._session() as db:
             db.execute("INSERT OR REPLACE INTO cache VALUES (?, ?, ?)", (key, json.dumps(value, ensure_ascii=False), now))
 
-    def audit(self, event: dict[str, Any]):
+    def audit(self, event: dict[str, Any], max_bytes: int = 20 * 1024 * 1024):
         event = {"timestamp": self.clock.now_utc().isoformat(), **event}
-        with open(self.log_path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(event, ensure_ascii=False) + "\n")
+        line = json.dumps(event, ensure_ascii=False) + "\n"
+        with self._audit_lock:
+            try:
+                if max_bytes > 0 and os.path.exists(self.log_path) and os.path.getsize(self.log_path) + len(line.encode("utf-8")) > max_bytes:
+                    stamp = self.clock.now_utc().strftime("%Y%m%dT%H%M%S%fZ")
+                    rotated_path = f"{self.log_path}.{stamp}"
+                    suffix = 1
+                    while os.path.exists(rotated_path):
+                        rotated_path = f"{self.log_path}.{stamp}.{suffix}"
+                        suffix += 1
+                    os.replace(self.log_path, rotated_path)
+            except FileNotFoundError:
+                pass
+            with open(self.log_path, "a", encoding="utf-8") as f:
+                f.write(line)
 
     def get_daily_bars(self, code: str, frequency: str, adjustflag: str, start_date: str, end_date: str) -> list[dict[str, Any]]:
         with self._session() as db:
@@ -621,7 +666,7 @@ class Storage:
         return row[0] if row else 0
 
     def set_meta(self, dataset: str, detail: str | None = None):
-        now = datetime.now(timezone.utc).isoformat()
+        now = self.clock.now_utc().isoformat()
         with self._session() as db:
             db.execute("""INSERT INTO dataset_meta(dataset, last_updated, detail)
                 VALUES (?, ?, ?)
@@ -794,6 +839,7 @@ class Storage:
                            rows_written: int | None = None, error_class: str | None = None):
         if status not in JOB_STATES:
             raise ValueError(f"invalid job status: {status}")
+        # staticmethod：无 self，使用模块级 UTC 时间（事务内由调用方控制节奏）。
         now = datetime.now(timezone.utc).isoformat()
         db.execute("""INSERT INTO download_jobs
             (dataset, batch_id, status, attempts, error, updated_at,
@@ -834,7 +880,7 @@ class Storage:
     # ---------- securities ----------
 
     def put_securities(self, rows: list[dict[str, Any]]):
-        now = datetime.now(timezone.utc).isoformat()
+        now = self.clock.now_utc().isoformat()
         values = [(
             r.get("code"), r.get("name", ""), r.get("trade_status", ""),
             r.get("ipo_date", ""), r.get("out_date", ""), r.get("type", ""),
@@ -897,7 +943,7 @@ class Storage:
     # ---------- index constituents ----------
 
     def put_index_constituents(self, index_code: str, asof_date: str, rows: list[dict[str, Any]]):
-        now = datetime.now(timezone.utc).isoformat()
+        now = self.clock.now_utc().isoformat()
         values = [(index_code, asof_date, r.get("code"), r.get("name", ""), now) for r in rows if r.get("code")]
         if not values:
             return
@@ -986,7 +1032,7 @@ class Storage:
     # ---------- dividends / adjust factors / industry ----------
 
     def put_dividend(self, code: str, year: int, year_type: str, payload: Any):
-        now = datetime.now(timezone.utc).isoformat()
+        now = self.clock.now_utc().isoformat()
         with self._session() as db:
             db.execute("""INSERT OR REPLACE INTO dividends(code, year, year_type, payload, fetched_at)
                 VALUES (?, ?, ?, ?, ?)""", (code, year, year_type, json.dumps(payload, ensure_ascii=False), now))
@@ -998,7 +1044,7 @@ class Storage:
         return row is not None
 
     def put_adjust_factors(self, code: str, rows: list[dict[str, Any]]):
-        now = datetime.now(timezone.utc).isoformat()
+        now = self.clock.now_utc().isoformat()
         values = [(code, r.get("date", ""), json.dumps(r, ensure_ascii=False), now) for r in rows if r.get("date")]
         if not values:
             return
@@ -1007,7 +1053,7 @@ class Storage:
                 VALUES (?, ?, ?, ?)""", values)
 
     def put_stock_industry(self, rows: list[dict[str, Any]]):
-        now = datetime.now(timezone.utc).isoformat()
+        now = self.clock.now_utc().isoformat()
         values = [(r.get("code"), r.get("industry", ""), r.get("classification", ""), r.get("update_date", ""), now)
                   for r in rows if r.get("code")]
         if not values:

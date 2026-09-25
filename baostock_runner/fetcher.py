@@ -102,10 +102,11 @@ class Fetcher:
 
     @property
     def fetch_budget(self) -> int:
-        return int(self.settings.daily_hard_limit * self.settings.fetch_budget_ratio)
+        return max(0, min(self.settings.daily_hard_limit,
+                          int(self.settings.daily_hard_limit * self.settings.fetch_budget_ratio)))
 
     def budget_left(self) -> int:
-        return max(0, self.fetch_budget - self.storage.download_usage_today())
+        return max(0, self.fetch_budget - self.storage.download_usage_today_conservative())
 
     # ---------- main loop ----------
 
@@ -354,8 +355,7 @@ class Fetcher:
                             "end_date": win["end"],
                             "frequency": "d",
                             "adjustflag": af,
-                        }, use_cache=False, priority=1)
-                        self.storage.increment_download_usage()
+                        }, use_cache=False, priority=1, origin="fetcher")
                 # 无缺口时无需请求；仍记录 job（用于当日去重/断点续传）。
                 self.storage.job_upsert("daily_bars", f"{code}|{af}", self.storage.JOB_SUCCEEDED)
             done += 1
@@ -585,7 +585,4 @@ class Fetcher:
         """
         if self.budget_left() <= 0:
             raise BudgetExhausted()
-        result = self.gateway.call(method, params, use_cache=False, priority=1)
-        # 真实请求成功后才计入下载预算（gateway 侧只计总 usage）。
-        self.storage.increment_download_usage()
-        return result
+        return self.gateway.call(method, params, use_cache=False, priority=1, origin="fetcher")

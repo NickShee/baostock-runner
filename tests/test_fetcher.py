@@ -34,19 +34,27 @@ def _ready_storage(storage, fetcher):
 
     同时写入今天与 2099 的日线 bar，使日线"已追平到最新"（缺口检查无活），
     从而让 _step_once 可以进入财务阶段测试。
+
+    meta 写入必须与 fetcher 使用同一固定时钟：直接以 fetcher.clock 作为 storage
+    时钟写入（临时替换），避免默认真实时钟与固定业务日跨日后失配。
     """
-    storage.put_securities([{"code": "sh.600000", "name": "浦发", "status": "1"}])
-    storage.set_meta("stock_industry", detail="ready")
-    storage.set_meta("index_constituents", detail="ready")
-    today = fetcher.business_today
-    storage.put_trade_calendar([
-        {"calendar_date": today, "is_trading_day": 1},
-        {"calendar_date": "2099-01-01", "is_trading_day": 1},
-    ])
-    storage.put_daily_bars("sh.600000", "d", "3", [
-        {"date": today, "code": "sh.600000", "close": "10"},
-        {"date": "2099-01-01", "code": "sh.600000", "close": "10"},
-    ])
+    saved_clock = storage.clock
+    storage.clock = fetcher.clock
+    try:
+        storage.put_securities([{"code": "sh.600000", "name": "浦发", "status": "1"}])
+        storage.set_meta("stock_industry", detail="ready")
+        storage.set_meta("index_constituents", detail="ready")
+        today = fetcher.business_today
+        storage.put_trade_calendar([
+            {"calendar_date": today, "is_trading_day": 1},
+            {"calendar_date": "2099-01-01", "is_trading_day": 1},
+        ])
+        storage.put_daily_bars("sh.600000", "d", "3", [
+            {"date": today, "code": "sh.600000", "close": "10"},
+            {"date": "2099-01-01", "code": "sh.600000", "close": "10"},
+        ])
+    finally:
+        storage.clock = saved_clock
 
 
 class StorageFetchSchemaTest(unittest.TestCase):

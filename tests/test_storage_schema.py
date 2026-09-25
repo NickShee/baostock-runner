@@ -170,6 +170,23 @@ class BackupRestoreTest(unittest.TestCase):
             self.assertEqual(info["integrity"], "ok")
             self.assertEqual(info["rows"]["securities"], 1)
 
+    def test_request_reservation_is_atomic_and_rotates_audit_log(self):
+        with tempfile.TemporaryDirectory() as d:
+            storage = _mk(os.path.join(d, "data.sqlite3"), os.path.join(d, "audit.jsonl"))
+            self.assertEqual(storage.reserve_request("fetcher", 2, 1), (1, 1))
+            with self.assertRaisesRegex(RuntimeError, "background.*budget"):
+                storage.reserve_request("fetcher", 2, 1)
+            self.assertEqual(storage.reserve_request("mcp", 2, 1), (2, 1))
+            with self.assertRaisesRegex(RuntimeError, "hard limit"):
+                storage.reserve_request("mcp", 2, 1)
+            storage.audit({"status": "first"}, max_bytes=1)
+            storage.audit({"status": "second"}, max_bytes=1)
+            names = os.listdir(d)
+            rotated = [name for name in names if name.startswith("audit.jsonl.")]
+            self.assertEqual(len(rotated), 1)
+            with open(os.path.join(d, "audit.jsonl"), encoding="utf-8") as stream:
+                self.assertIn('"status": "second"', stream.read())
+
 
 if __name__ == "__main__":
     unittest.main()

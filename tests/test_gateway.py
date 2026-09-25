@@ -1,12 +1,14 @@
 import os
+import queue
 import sys
 import tempfile
+import threading
 import time
 import types
 import unittest
 
 from baostock_runner.config import Settings
-from baostock_runner.gateway import BaoStockGateway, ReconnectableFailure
+from baostock_runner.gateway import BaoStockGateway, Job, ReconnectableFailure
 
 
 class _FakeResult:
@@ -170,6 +172,7 @@ class GatewayTest(unittest.TestCase):
                 params = {"code": "sh.600000", "fields": "date,code,close", "start_date": "2026-09-15", "end_date": "2026-09-16", "frequency": "d", "adjustflag": "3"}
                 result = gateway.call("query_history_k_data_plus", params)
                 self.assertEqual(result["data"][0]["close"], "10.0")
+                self.assertTrue(result["request_id"])
                 # 启动登录 1 次 + 会话过期主动重连 1 次
                 self.assertEqual(fake.login_count, 2)
                 self.assertGreaterEqual(fake.logout_count, 1)
@@ -249,8 +252,8 @@ class GatewayTest(unittest.TestCase):
             try:
                 with self.assertRaisesRegex(RuntimeError, "result set exceeded"):
                     gateway.call("query_history_k_data_plus", {"code": "sh.600000", "start_date": "2026-09-15", "end_date": "2026-09-16"})
-                # 死在 increment_usage 之前：usage 不应被计入
-                self.assertEqual(gateway.storage.usage_today(), 0)
+                # 远端方法已实际调用，即使结果遍历失败也必须记一次尝试。
+                self.assertEqual(gateway.storage.usage_today(), 3)  # startup login/validation + query attempt
             finally:
                 gateway.close()
 
@@ -351,6 +354,99 @@ class GatewayTest(unittest.TestCase):
                 self.assertFalse(gateway._watchdog_tick())
             finally:
                 gateway.close()
+
+    def test_background_budget_is_enforced_by_gateway_and_cache_is_free(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings = Settings(db_path=os.path.join(directory, "data.sqlite3"),
+                                log_path=os.path.join(directory, "audit.jsonl"),
+                                min_interval_seconds=0, daily_hard_limit=4,
+                                fetch_budget_ratio=0.25, offline=True)
+            gateway = BaoStockGateway(settings)
+            try:
+                params = {"start_date": "2026-01-01", "end_date": "2026-01-02"}
+                gateway.call("query_trade_dates", params, origin="fetcher")
+                self.assertEqual(gateway.storage.download_usage_today(), 1)
+                with self.assertRaisesRegex(RuntimeError, "background.*budget"):
+                    gateway.call("query_all_stock", {"day": "2026-01-02"}, origin="fetcher")
+                gateway.call("query_all_stock", {"day": "2026-01-02"}, origin="mcp")
+                before = gateway.storage.usage_today()
+                hit = gateway.call("query_trade_dates", params, origin="mcp")
+                self.assertTrue(hit["cache_hit"])
+                self.assertEqual(gateway.storage.usage_today(), before)
+                self.assertEqual(gateway.health_status()["queue_capacity"], settings.request_queue_capacity)
+            finally:
+                gateway.close()
+
+    def test_caller_deadline_does_not_cancel_running_sdk_call(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings = Settings(db_path=os.path.join(directory, "data.sqlite3"),
+                                log_path=os.path.join(directory, "audit.jsonl"),
+                                min_interval_seconds=0, daily_hard_limit=20, offline=True)
+            gateway = BaoStockGateway(settings)
+            entered, release, completed = threading.Event(), threading.Event(), threading.Event()
+            original = gateway._execute
+
+            def slow(bs, method, params, use_cache=True):
+                entered.set()
+                release.wait(2)
+                value = original(bs, method, params, use_cache)
+                completed.set()
+                return value
+
+            gateway._execute = slow
+            try:
+                with self.assertRaises(TimeoutError):
+                    gateway.call("query_trade_dates", {"start_date": "2026-01-01", "end_date": "2026-01-02"},
+                                 deadline_seconds=0.05)
+                self.assertTrue(entered.wait(1))
+                release.set()
+                # 语义：调用方超时后 worker 上的 SDK 调用最终完成（不取消）。
+                # 等待窗口取 5s：慢存储（如 btrfs）上 reserve_request 的 commit fsync
+                # 可能耗时 >1s，且全量测试并发负载会放大延迟；等待窗只验证"最终完成"，
+                # 不要求 1s 内完成，避免环境性误报。
+                self.assertTrue(completed.wait(5))
+                self.assertEqual(gateway.storage.usage_today(), 1)
+            finally:
+                release.set()
+                gateway.close()
+
+    def test_retry_attempts_are_counted_before_each_upstream_call(self):
+        fake = _FakeBS()
+        fake.fail_queries = 1
+        self._install_fake_baostock(fake)
+        with tempfile.TemporaryDirectory() as directory:
+            settings = Settings(db_path=os.path.join(directory, "data.sqlite3"),
+                                log_path=os.path.join(directory, "audit.jsonl"),
+                                min_interval_seconds=0, daily_hard_limit=20,
+                                max_retries=1, retry_delays=(), offline=False,
+                                verify_after_login=True)
+            gateway = BaoStockGateway(settings)
+            try:
+                gateway.call("query_history_k_data_plus", {"code": "sh.600000", "fields": "date,code,close",
+                             "start_date": "2026-09-15", "end_date": "2026-09-16",
+                             "frequency": "d", "adjustflag": "3"}, origin="fetcher")
+                # startup login + verification + one failed query + its retry
+                self.assertEqual(gateway.storage.usage_today(), 4)
+                self.assertEqual(gateway.storage.download_usage_today(), 2)
+            finally:
+                gateway.close()
+
+    def test_aged_fetcher_runs_after_foreground_burst_without_losing_foreground(self):
+        gateway = object.__new__(BaoStockGateway)
+        gateway.settings = Settings(background_fairness_wait_seconds=60,
+                                    background_fairness_foreground_burst=10)
+        gateway.jobs = queue.PriorityQueue()
+        gateway._foreground_since_background = 10
+        now = time.monotonic()
+        bg = Job("background", {}, queue.Queue(), priority=1, origin="fetcher",
+                 enqueued_at=now - 61)
+        gateway.jobs.put((1, 0, bg))
+        for index in range(11):
+            fg = Job("foreground", {}, queue.Queue(), priority=0, origin="mcp", enqueued_at=now)
+            gateway.jobs.put((0, index + 1, fg))
+        selected = gateway._take_job()
+        self.assertIs(selected, bg)
+        self.assertEqual(gateway.jobs.qsize(), 11)
 
 
 if __name__ == "__main__":

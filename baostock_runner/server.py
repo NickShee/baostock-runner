@@ -167,7 +167,7 @@ def get_latest_stock_snapshot(codes: list[str], adjust: str = "none") -> dict:
 @mcp.tool()
 def gateway_status() -> dict:
     """Return cache/request status and whether the circuit breaker is open."""
-    count = gateway.storage.usage_today()
+    count = gateway.storage.usage_today_conservative()
     return {
         "request_count_today": count,
         "warning_limit": gateway.settings.daily_warning_limit,
@@ -175,6 +175,11 @@ def gateway_status() -> dict:
         "warning_limit_reached": count >= gateway.settings.daily_warning_limit,
         "circuit_breaker_open": gateway.breaker.is_set(),
         "queue_length": gateway.jobs.qsize(),
+        "health": gateway.health_status(),
+        "background_requests_today": gateway.storage.download_usage_today_conservative(),
+        "background_budget_limit": max(0, min(gateway.settings.daily_hard_limit,
+                                               int(gateway.settings.daily_hard_limit * gateway.settings.fetch_budget_ratio))),
+        "request_queue_capacity": gateway.settings.request_queue_capacity,
         "offline": gateway.settings.offline,
         "fetcher_budget_left": fetcher.budget_left(),
     }

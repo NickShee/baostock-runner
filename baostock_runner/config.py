@@ -81,6 +81,13 @@ class Settings:
     # 网络失败指数退避：起始秒、最大秒。
     task_retry_base_seconds: int = _int("BAOSTOCK_TASK_RETRY_BASE_SECONDS", 60)
     task_retry_max_seconds: int = _int("BAOSTOCK_TASK_RETRY_MAX_SECONDS", 3600)
+    # --- B-02: bounded request queue and request deadlines ---
+    request_queue_capacity: int = _int("BAOSTOCK_REQUEST_QUEUE_CAPACITY", 256)
+    foreground_request_deadline_seconds: int = _int("BAOSTOCK_FOREGROUND_DEADLINE_SECONDS", 120)
+    background_request_deadline_seconds: int = _int("BAOSTOCK_BACKGROUND_DEADLINE_SECONDS", 300)
+    background_fairness_wait_seconds: int = _int("BAOSTOCK_BACKGROUND_FAIRNESS_WAIT_SECONDS", 60)
+    background_fairness_foreground_burst: int = _int("BAOSTOCK_BACKGROUND_FAIRNESS_FOREGROUND_BURST", 10)
+    audit_log_max_bytes: int = _int("BAOSTOCK_AUDIT_LOG_MAX_BYTES", 20 * 1024 * 1024)
     # --- worker heartbeat / watchdog ---
     # gateway worker 心跳看门狗：worker 卡死（如 baostock rs.next() 在半开连接下死循环）
     # 且心跳停滞超过阈值时，主动终止进程，由容器 restart 策略自动拉起。
