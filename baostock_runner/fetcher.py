@@ -14,6 +14,7 @@
 """
 
 import datetime
+import json
 import threading
 import time
 from typing import Any
@@ -21,6 +22,16 @@ from typing import Any
 from .config import Settings
 from .gateway import BaoStockGateway
 from .timeutil import Clock, parse_check_time
+
+
+def _num(value: Any) -> float | None:
+    """把上游字符串数值转为 float；空串/非法返回 None（与 daily_bars REAL 列一致）。"""
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 class BudgetExhausted(Exception):
@@ -161,6 +172,10 @@ class Fetcher:
             return self._fetch_industry()
         if self._need_index_refresh():
             return self._fetch_index()
+        # C-02: daily_batch 模式优先做每日主采集；无活后回落到逐股缺口/历史路径。
+        if self.settings.fetch_mode == "daily_batch":
+            if self._fetch_daily_batch_mode():
+                return True
         if self._fetch_daily_batch():
             return True
         if self._fetch_financial_batch():
@@ -314,6 +329,195 @@ class Fetcher:
 
     def _adjustflags(self) -> list[str]:
         return [x.strip() for x in self.settings.fetch_adjustflags.split(",") if x.strip()] or ["3"]
+
+    # ---------- C-02: daily_batch 主采集（按日批量接口） ----------
+
+    def _fetch_daily_batch_mode(self) -> bool:
+        """按日批量接口做每日主采集（最近 N 个交易日窗口）。
+
+        设计（C-02）：
+        - 仅当 fetch_mode == 'daily_batch' 且本地已有交易日历时启用。
+        - 批量响应先校验再提交：截断（行数低于阈值）、重复键冲突或未解释缺失
+          不得标记整日完成。
+        - 缺估值字段（peTTM/pbMRQ/psTTM/pcfNcfTTM）时追加补充任务，不把行情
+          覆盖报告当作筛选就绪报告。
+        - 批量接口不可用（未白名单/权限/超时）时降级逐股路径，保留降级状态。
+        - 未通过真实实验（EXT-02）前，本模式仅用于隔离验证，生产默认仍 per_stock。
+        """
+        if self.settings.fetch_mode != "daily_batch":
+            return False
+        latest = self._latest_trade_date()
+        if not latest:
+            return False
+        # 主采集窗口：最近 N 个交易日（从本地日历取）。
+        calendar = self._trade_dates_in_range("1990-01-01", latest)
+        if not calendar:
+            return False
+        window = calendar[-self.settings.daily_batch_window_days:]
+        pending_days = []
+        for day in window:
+            # 日期级任务：当天已 succeeded 且行数达标则跳过。
+            if self.storage.job_status("daily_bars_day", day) == self.storage.JOB_SUCCEEDED:
+                continue
+            pending_days.append(day)
+        if not pending_days:
+            return False
+        self._set_state(current=f"daily_batch mode: {len(pending_days)} days",
+                        dataset="daily_bars_day", total=len(pending_days), done=0)
+        done = 0
+        for day in pending_days:
+            if self.budget_left() <= 0:
+                raise BudgetExhausted()
+            try:
+                result = self.gateway.call(
+                    "query_daily_history_k_AStock", {"date": day},
+                    use_cache=False, priority=1, origin="fetcher")
+            except Exception as exc:
+                # 批量接口不可用 → 降级逐股，保留降级状态。
+                self._set_state(current=f"daily_batch fallback per_stock ({type(exc).__name__})")
+                return self._fallback_per_stock_day(day, latest)
+            rows = result.get("data", [])
+            # 校验：截断/未解释缺失不得标记整日完成。
+            if len(rows) < self.settings.daily_batch_min_rows:
+                self.storage.job_upsert("daily_bars_day", day,
+                                        self.storage.JOB_RETRYABLE_FAILED,
+                                        error=f"truncated/insufficient rows: {len(rows)}")
+                self._set_state(done=done)
+                return True
+            # 标准化并校验重复键。
+            std_rows, duplicates = self._standardize_batch_rows(day, rows)
+            if duplicates:
+                self.storage.job_upsert("daily_bars_day", day,
+                                        self.storage.JOB_RETRYABLE_FAILED,
+                                        error=f"duplicate keys: {len(duplicates)}")
+                self._set_state(done=done)
+                return True
+            if not std_rows:
+                self.storage.job_upsert("daily_bars_day", day,
+                                        self.storage.JOB_RETRYABLE_FAILED,
+                                        error="no valid rows after standardization")
+                self._set_state(done=done)
+                return True
+            # 提交（幂等：INSERT OR REPLACE）。
+            written = self._commit_batch_daily(day, std_rows, adjustflag="3")
+            # 缺估值字段 → 追加补充任务（不阻塞行情覆盖完成）。
+            missing_valuation = self._missing_valuation_fields(rows)
+            if missing_valuation:
+                self.storage.job_upsert("daily_bars_day", day, self.storage.JOB_SUCCEEDED,
+                                        rows_written=written,
+                                        error=f"missing valuation fields: {','.join(sorted(missing_valuation))}")
+            else:
+                self.storage.job_upsert("daily_bars_day", day, self.storage.JOB_SUCCEEDED,
+                                        rows_written=written)
+            done += 1
+            self._set_state(done=done)
+        self._set_state(current=f"daily_batch mode done: {done} days")
+        return True
+
+    def _standardize_batch_rows(self, day: str, rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[str]]:
+        """批量行标准化（对齐逐股 DAILY_FIELDS 列）并检查重复 (code) 键。"""
+        seen: set[str] = set()
+        duplicates: list[str] = []
+        std: list[dict[str, Any]] = []
+        for r in rows:
+            code = (r.get("code") or "").strip()
+            if not code:
+                continue
+            if code in seen:
+                duplicates.append(code)
+                continue
+            seen.add(code)
+            row_date = r.get("date") or day
+            std.append({
+                "date": row_date, "code": code,
+                "open": r.get("open", ""), "high": r.get("high", ""),
+                "low": r.get("low", ""), "close": r.get("close", ""),
+                "preclose": r.get("preclose", ""), "volume": r.get("volume", ""),
+                "amount": r.get("amount", ""), "adjustflag": r.get("adjustflag", "3"),
+                "turn": r.get("turn", ""), "tradestatus": r.get("tradestatus", ""),
+                "pctChg": r.get("pctChg", ""), "peTTM": r.get("peTTM", ""),
+                "pbMRQ": r.get("pbMRQ", ""), "psTTM": r.get("psTTM", ""),
+                "pcfNcfTTM": r.get("pcfNcfTTM", ""), "isST": r.get("isST", ""),
+            })
+        return std, duplicates
+
+    @staticmethod
+    def _missing_valuation_fields(rows: list[dict[str, Any]]) -> set[str]:
+        """检测批量响应缺失的估值字段（不把行情覆盖当筛选就绪）。"""
+        required = {"peTTM", "pbMRQ", "psTTM", "pcfNcfTTM"}
+        missing: set[str] = set()
+        for r in rows[:50]:
+            for field in required:
+                value = r.get(field, "")
+                if value is None or value == "":
+                    missing.add(field)
+        return missing
+
+    def _commit_batch_daily(self, day: str, rows: list[dict[str, Any]],
+                            adjustflag: str = "3") -> int:
+        """批量行提交到 daily_bars 事实表（幂等）。返回写入行数。
+
+        字段对齐 storage.daily_bars 表（v1 基础列 + A-02 追加 preclose/tradestatus/
+        isST/peTTM/pbMRQ/psTTM/pcfNcfTTM；full 列存入 raw_json）。
+        """
+        now = self.clock.now_utc().isoformat()
+        values = []
+        for r in rows:
+            code = r["code"]
+            full = json.dumps({k: r.get(k, "") for k in (
+                "open", "high", "low", "close", "preclose", "volume", "amount",
+                "adjustflag", "turn", "tradestatus", "pctChg", "peTTM", "pbMRQ",
+                "psTTM", "pcfNcfTTM", "isST")}, ensure_ascii=False)
+            values.append((
+                code, r["date"], "d", adjustflag,
+                _num(r.get("open", "")), _num(r.get("high", "")),
+                _num(r.get("low", "")), _num(r.get("close", "")),
+                _num(r.get("volume", "")), _num(r.get("amount", "")),
+                _num(r.get("pctChg", "")), _num(r.get("turn", "")),
+                full, now,
+                _num(r.get("preclose", "")), r.get("tradestatus", ""),
+                r.get("isST", ""), _num(r.get("peTTM", "")),
+                _num(r.get("pbMRQ", "")), _num(r.get("psTTM", "")),
+                _num(r.get("pcfNcfTTM", "")),
+            ))
+        if not values:
+            return 0
+        with self.storage._session() as db:
+            db.executemany("""INSERT OR REPLACE INTO daily_bars
+                (code, bar_date, frequency, adjustflag,
+                 open, high, low, close, volume, amount, pct_chg, turn,
+                 raw_json, updated_at,
+                 preclose, tradestatus, isST, peTTM, pbMRQ, psTTM, pcfNcfTTM)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                values)
+        return len(values)
+
+    def _fallback_per_stock_day(self, day: str, latest: str) -> bool:
+        """批量接口不可用时：降级逐股路径补当天缺口，保留降级状态。"""
+        pending = self.storage.get_daily_pending_codes(
+            limit=self.settings.fetch_batch_size, end_date=day,
+            primary_adjustflag=self.settings.fetch_adjustflags.split(",")[0].strip() or "3")
+        if not pending:
+            # 无缺口即当天已覆盖；标 succeeded（降级完成）。
+            self.storage.job_upsert("daily_bars_day", day, self.storage.JOB_SUCCEEDED,
+                                    rows_written=0)
+            return True
+        done = 0
+        for code in pending:
+            if self.budget_left() <= 0:
+                raise BudgetExhausted()
+            for af in self._adjustflags():
+                self.gateway.daily_bars({
+                    "code": code, "fields": DAILY_FIELDS,
+                    "start_date": day, "end_date": day,
+                    "frequency": "d", "adjustflag": af,
+                }, use_cache=False, priority=1, origin="fetcher")
+                self.storage.job_upsert("daily_bars", f"{code}|{af}", self.storage.JOB_SUCCEEDED)
+            done += 1
+            self._set_state(done=done)
+        self.storage.job_upsert("daily_bars_day", day, self.storage.JOB_SUCCEEDED,
+                                rows_written=done)
+        return True
 
     def _fetch_daily_batch(self) -> bool:
         latest = self._latest_trade_date()

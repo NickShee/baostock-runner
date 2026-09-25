@@ -104,6 +104,19 @@ class Settings:
     # 近期行情判定窗口（天）：日线区间终点距今 <= 该值视为"近期"。
     cache_recent_quotes_window_days: int = _int("BAOSTOCK_CACHE_RECENT_QUOTES_WINDOW_DAYS", 5)
     # 旧无分类缓存（A-04 迁移前的 cache 行）在启动后视为已过期，不清空事实表。
+    # --- C-02: 每日主采集模式 ---
+    # per_stock（默认）：逐股缺口补批（历史回填/缺口走逐股路径）。
+    # daily_batch：按日批量接口做每日主采集；历史回填/缺口仍走逐股路径。
+    # 注意：未通过真实实验（EXT-02）验证批量接口前，禁止切换为 daily_batch。
+    fetch_mode: str = os.getenv("BAOSTOCK_FETCH_MODE", "per_stock")
+    # daily_batch 模式下批量接口不可用（未白名单/权限/超时）时，是否降级逐股路径。
+    daily_batch_fallback_to_per_stock: bool = os.getenv(
+        "BAOSTOCK_DAILY_BATCH_FALLBACK", "true").lower() == "true"
+    # daily_batch 主采集覆盖的最近交易日窗口（天）：只拉最近 N 个交易日的主采集，
+    # 更早历史回填/缺口仍走逐股路径。
+    daily_batch_window_days: int = _int("BAOSTOCK_DAILY_BATCH_WINDOW_DAYS", 7)
+    # 批量接口单日行数阈值：超过视为可能截断，不标记整日完成（隔离验证默认宽松）。
+    daily_batch_min_rows: int = _int("BAOSTOCK_DAILY_BATCH_MIN_ROWS", 500)
     # --- worker heartbeat / watchdog ---
     # gateway worker 心跳看门狗：worker 卡死（如 baostock rs.next() 在半开连接下死循环）
     # 且心跳停滞超过阈值时，主动终止进程，由容器 restart 策略自动拉起。

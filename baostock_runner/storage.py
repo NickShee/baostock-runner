@@ -836,6 +836,14 @@ class Storage:
         # 读时归一化：兼容迁移前遗留的旧 'done' 状态（A-03）。
         return JOB_SUCCEEDED if row[0] == "done" else row[0]
 
+    def job_detail(self, dataset: str, batch_id: str) -> str | None:
+        """返回任务 error/detail 字段（用于测试与诊断；无记录返回 None）。"""
+        with self._session() as db:
+            row = db.execute(
+                "SELECT error FROM download_jobs WHERE dataset=? AND batch_id=?",
+                (dataset, batch_id)).fetchone()
+        return row[0] if row else None
+
     def job_stats(self, dataset: str | None = None) -> dict[str, int]:
         with self._session() as db:
             if dataset:
