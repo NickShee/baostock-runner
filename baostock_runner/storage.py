@@ -8,10 +8,10 @@ from typing import Any, Callable
 
 from .timeutil import Clock
 
-# B-01: schema 版本。当前最新版本为 4。
+# B-01: schema 版本。当前最新版本为 5。
 # 迁移采用顺序执行：旧库（user_version < SCHEMA_VERSION）逐版本升级；
 # 未知更高版本（user_version > SCHEMA_VERSION）启动时拒绝写入，防止旧代码破坏新库。
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 # A-03: 任务状态机。
 JOB_PENDING = "pending"
@@ -145,6 +145,36 @@ MIGRATIONS: dict[int, list[Any]] = {
         lambda db: _add_column_if_missing(db, "cache", "is_empty", "INTEGER"),
         # 旧无分类缓存到期失效：迁移前 cache 行无 expires_at（NULL），
         # 读缓存时视为已过期（A-04：不清空事实表，仅停止命中）。
+    ],
+    # D-01: 最小标准模型与版本留存。
+    # - securities 增加资产类型与来源（保留 code 兼容标识）。
+    # - data_batches 记录采集批次（来源/版本/范围/状态/行数）。
+    # - security_versions 记录证券主数据观察版本（更新可追溯）。
+    # - financials 增加公告日期/报告期标准列（报告期/公告日期/观察时间）。
+    5: [
+        lambda db: _add_column_if_missing(db, "securities", "asset_type", "TEXT"),
+        lambda db: _add_column_if_missing(db, "securities", "source", "TEXT"),
+        lambda db: _add_column_if_missing(db, "financials", "pub_date", "TEXT"),
+        lambda db: _add_column_if_missing(db, "financials", "stat_date", "TEXT"),
+        """CREATE TABLE IF NOT EXISTS data_batches (
+            batch_id TEXT PRIMARY KEY,
+            source TEXT NOT NULL,
+            data_version TEXT NOT NULL,
+            scope TEXT NOT NULL,
+            status TEXT NOT NULL,
+            rows_written INTEGER NOT NULL DEFAULT 0,
+            started_at TEXT,
+            finished_at TEXT,
+            detail TEXT)""",
+        """CREATE TABLE IF NOT EXISTS security_versions (
+            code TEXT NOT NULL,
+            observed_at TEXT NOT NULL,
+            name TEXT, trade_status TEXT,
+            ipo_date TEXT, out_date TEXT,
+            type TEXT, status TEXT,
+            asset_type TEXT, source TEXT,
+            PRIMARY KEY(code, observed_at))""",
+        "CREATE INDEX IF NOT EXISTS idx_sec_versions_code ON security_versions(code, observed_at)",
     ],
 }
 
@@ -942,8 +972,16 @@ class Storage:
     def _put_financials_in_txn(db: sqlite3.Connection, dataset: str, code: str,
                                year: int, quarter: int, payload: dict[str, Any],
                                fetched_at: str | None = None):
-        """事务内写财务数据（含修订归档），与 job 状态同事务提交。"""
+        """事务内写财务数据（含修订归档），与 job 状态同事务提交。
+
+        D-01: 同时写入标准元信息 pub_date（公告日期）/stat_date（报告期），
+        从 payload 提取，缺失留空不猜值。
+        """
+        from .standard import standardize_financial_meta
         now = fetched_at or datetime.now(timezone.utc).isoformat()
+        meta = standardize_financial_meta(payload)
+        pub_date = meta.get("pub_date", "")
+        stat_date = meta.get("stat_date", "")
         old = db.execute(
             "SELECT payload, fetched_at FROM financials WHERE dataset=? AND code=? AND year=? AND quarter=?",
             (dataset, code, year, quarter)).fetchone()
@@ -957,32 +995,108 @@ class Storage:
                     (dataset, code, year, quarter, revision, payload, fetched_at)
                     VALUES (?, ?, ?, ?, ?, ?, ?)""",
                     (dataset, code, year, quarter, rev + 1, old_payload, old[1]))
-        db.execute("""INSERT OR REPLACE INTO financials(dataset, code, year, quarter, payload, fetched_at)
-            VALUES (?, ?, ?, ?, ?, ?)""", (dataset, code, year, quarter, json.dumps(payload, ensure_ascii=False), now))
+        db.execute("""INSERT OR REPLACE INTO financials(dataset, code, year, quarter, payload, fetched_at,
+                                                       pub_date, stat_date)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (dataset, code, year, quarter, json.dumps(payload, ensure_ascii=False), now, pub_date, stat_date))
 
     # ---------- securities ----------
 
     def put_securities(self, rows: list[dict[str, Any]]):
+        """D-01: 写证券主数据（保留 code 兼容标识），并记录观察版本到 security_versions。
+
+        - 通过 standard.standardize_security 集中映射上游字段（code_name/ipoDate → name/ipo_date），
+          同时兼容标准键（name/ipo_date）。
+        - asset_type/source 默认 'stock'/'baostock'，可由行内字段覆盖；未知来源不补造。
+        """
+        from .standard import standardize_security
         now = self.clock.now_utc().isoformat()
-        values = [(
-            r.get("code"), r.get("name", ""), r.get("trade_status", ""),
-            r.get("ipo_date", ""), r.get("out_date", ""), r.get("type", ""),
-            r.get("status", ""), now,
-        ) for r in rows if r.get("code")]
+        values = []
+        versions = []
+        for r in rows:
+            code = r.get("code")
+            if not code:
+                continue
+            std = standardize_security(
+                r, source=r.get("source", "baostock"),
+                asset_type=r.get("asset_type", "stock"))
+            values.append((
+                code, std.get("name", ""), std.get("trade_status", ""),
+                std.get("ipo_date", ""), std.get("out_date", ""), std.get("type", ""),
+                std.get("status", ""), std.get("asset_type", "stock"),
+                std.get("source", "baostock"), now,
+            ))
+            versions.append((
+                code, now, std.get("name", ""), std.get("trade_status", ""),
+                std.get("ipo_date", ""), std.get("out_date", ""), std.get("type", ""),
+                std.get("status", ""), std.get("asset_type", "stock"),
+                std.get("source", "baostock"),
+            ))
         if not values:
             return
         with self._session() as db:
             db.executemany("""INSERT OR REPLACE INTO securities
-                (code, name, trade_status, ipo_date, out_date, type, status, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)""", values)
+                (code, name, trade_status, ipo_date, out_date, type, status,
+                 asset_type, source, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", values)
+            # D-01: 观察版本记录（同一批次多次写入同 code 时按 PRIMARY KEY 幂等，
+            # 不同批次/时间自然形成版本序列，更新可追溯）。
+            db.executemany("""INSERT OR REPLACE INTO security_versions
+                (code, observed_at, name, trade_status, ipo_date, out_date,
+                 type, status, asset_type, source)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", versions)
 
     def get_securities(self) -> list[dict[str, Any]]:
         with self._session() as db:
             rows = db.execute(
-                """SELECT code, name, trade_status, ipo_date, out_date, type, status
+                """SELECT code, name, trade_status, ipo_date, out_date, type, status,
+                          asset_type, source
                    FROM securities ORDER BY code""").fetchall()
-        keys = ("code", "name", "trade_status", "ipo_date", "out_date", "type", "status")
+        keys = ("code", "name", "trade_status", "ipo_date", "out_date", "type", "status",
+                "asset_type", "source")
         return [dict(zip(keys, row)) for row in rows]
+
+    def get_security_versions(self, code: str) -> list[dict[str, Any]]:
+        """D-01: 证券主数据观察版本序列（旧版本可追溯/重建）。"""
+        with self._session() as db:
+            rows = db.execute(
+                """SELECT code, observed_at, name, trade_status, ipo_date, out_date,
+                          type, status, asset_type, source
+                   FROM security_versions WHERE code=? ORDER BY observed_at""",
+                (code,)).fetchall()
+        keys = ("code", "observed_at", "name", "trade_status", "ipo_date", "out_date",
+                "type", "status", "asset_type", "source")
+        return [dict(zip(keys, row)) for row in rows]
+
+    # ---------- D-01: 采集批次 ----------
+
+    def batch_start(self, batch_id: str, source: str, data_version: str, scope: str) -> None:
+        now = self.clock.now_utc().isoformat()
+        with self._session() as db:
+            db.execute("""INSERT OR REPLACE INTO data_batches
+                (batch_id, source, data_version, scope, status, rows_written, started_at)
+                VALUES (?, ?, ?, ?, 'running', 0, ?)""",
+                (batch_id, source, data_version, scope, now))
+
+    def batch_finish(self, batch_id: str, status: str, rows_written: int,
+                     detail: str = "") -> None:
+        now = self.clock.now_utc().isoformat()
+        with self._session() as db:
+            db.execute("""UPDATE data_batches
+                SET status=?, rows_written=?, finished_at=?, detail=?
+                WHERE batch_id=?""", (status, rows_written, now, detail, batch_id))
+
+    def batch_status(self, batch_id: str) -> dict[str, Any] | None:
+        with self._session() as db:
+            row = db.execute(
+                """SELECT batch_id, source, data_version, scope, status, rows_written,
+                          started_at, finished_at, detail
+                   FROM data_batches WHERE batch_id=?""", (batch_id,)).fetchone()
+        if row is None:
+            return None
+        keys = ("batch_id", "source", "data_version", "scope", "status",
+                "rows_written", "started_at", "finished_at", "detail")
+        return dict(zip(keys, row))
 
     def get_securities_codes(self) -> list[str]:
         with self._session() as db:
