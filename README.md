@@ -228,6 +228,7 @@ get_market_coverage()
 - **C-01 按日批量接口实验工具**：类型化 Adapter 仅允许 `query_daily_history_k_AStock(date)`（全 A 股某日行情），不暴露任意远端方法入口；实验记录固定版本/签名/原始响应/字段映射/证券差集/性能报告，状态 `supported/partial/unsupported/unverified`（无真实访问必须 `unverified`）；真实实验只能走现有唯一 worker（EXT-02）。
 - **D-01 最小标准模型与版本留存**：securities 增加 `asset_type/source`（schema v5），保留 code 兼容标识；`security_versions` 观察版本可追溯/重建；`data_batches` 采集批次记录；financials 增加 `pub_date/stat_date` 标准列；字段映射集中在 `standard.py`；历史未知来源标记 unknown 不补造时间。
 - **C-02 每日主采集模式**：`fetch_mode` 支持 `per_stock`（默认）/`daily_batch`；`daily_batch` 按最近交易日窗口调批量接口，标准化后校验再提交（截断/重复键/未解释缺失不得标整日完成），缺估值字段追加补充任务；接口不可用降级逐股保留降级状态；未通过真实实验前仅隔离验证，不切换生产默认。
+- **D-02 复权映射与版本缓存**：`FactorAdapter` 把官方返回 `dividOperateDate` 映射为统一 `effective_date`（schema v6，不再依赖错误 `date` 假设）；`AdjustmentCalculator` 按累计因子（前/后复权）直接乘原价、不默认连乘；查询起点前因子未知返回不完整（不自动填 1）；复权结果缓存键含证券/区间/口径/基准日/行情版本/因子版本/算法版本；`adjust_factor_versions` 因子版本可追溯；本地算法未通过时可用带来源版本的官方复权结果临时路径。
 - **B-01 schema 版本与备份恢复**：`PRAGMA user_version` + 顺序迁移（新增表/列优先，幂等可重跑）；
   未知更高版本启动时拒绝写入；SQLite Online Backup 一致性备份与隔离恢复，完整性/行数/关键字段对账。
 

@@ -766,7 +766,9 @@ class Fetcher:
                     "start_date": self.settings.fetch_daily_start_date,
                     "end_date": self.business_today,
                 })
-                rows = [r for r in res["data"] if r.get("date")]
+                # D-02: 直接传原始行（含 dividOperateDate）给 storage，
+                # 由 FactorAdapter 映射为统一 effective_date；不再依赖错误的 'date' 假设。
+                rows = res["data"]
                 self.storage.put_adjust_factors(code, rows)
                 self.storage.job_upsert("adjust_factors", code, self.storage.JOB_SUCCEEDED,
                                         rows_written=len(rows))

@@ -8,10 +8,10 @@ from typing import Any, Callable
 
 from .timeutil import Clock
 
-# B-01: schema 版本。当前最新版本为 5。
+# B-01: schema 版本。当前最新版本为 6。
 # 迁移采用顺序执行：旧库（user_version < SCHEMA_VERSION）逐版本升级；
 # 未知更高版本（user_version > SCHEMA_VERSION）启动时拒绝写入，防止旧代码破坏新库。
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 # A-03: 任务状态机。
 JOB_PENDING = "pending"
@@ -176,6 +176,28 @@ MIGRATIONS: dict[int, list[Any]] = {
             PRIMARY KEY(code, observed_at))""",
         "CREATE INDEX IF NOT EXISTS idx_sec_versions_code ON security_versions(code, observed_at)",
     ],
+    # D-02: 复权映射、计算与版本缓存。
+    # - adjust_factors 增加统一 effective_date（除权除息日）与 adjust_flag/source/
+    #   algorithm_version；factor_date 保留兼容旧读取。
+    # - adjust_factor_versions 记录因子版本（观察时间可追溯）。
+    6: [
+        lambda db: _add_column_if_missing(db, "adjust_factors", "effective_date", "TEXT"),
+        lambda db: _add_column_if_missing(db, "adjust_factors", "adjust_flag", "TEXT"),
+        lambda db: _add_column_if_missing(db, "adjust_factors", "source", "TEXT"),
+        lambda db: _add_column_if_missing(db, "adjust_factors", "algorithm_version", "TEXT"),
+        # 索引仅在表存在时创建（旧库样本可能缺表，迁移需幂等健壮）。
+        lambda db: _create_index_if_table_exists(db, "adjust_factors", "idx_adj_effective",
+                                                 "(code, effective_date)"),
+        """CREATE TABLE IF NOT EXISTS adjust_factor_versions (
+            code TEXT NOT NULL,
+            effective_date TEXT NOT NULL,
+            observed_at TEXT NOT NULL,
+            adjust_flag TEXT NOT NULL,
+            source TEXT NOT NULL,
+            algorithm_version TEXT,
+            payload TEXT NOT NULL,
+            PRIMARY KEY(code, effective_date, observed_at, adjust_flag))""",
+    ],
 }
 
 
@@ -200,6 +222,16 @@ def _add_column_if_missing(db: sqlite3.Connection, table: str, column: str, colt
     columns = {row[1] for row in db.execute(f"PRAGMA table_info({table})")}
     if column not in columns:
         db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
+
+
+def _create_index_if_table_exists(db: sqlite3.Connection, table: str, index_name: str,
+                                  columns_sql: str) -> None:
+    """幂等 CREATE INDEX：表不存在时跳过（迁移需兼容缺表的旧库样本）。"""
+    tables = {row[0] for row in db.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'")}
+    if table not in tables:
+        return
+    db.execute(f"CREATE INDEX IF NOT EXISTS {index_name} ON {table} {columns_sql}")
 
 
 def _date_range(start_date: str, end_date: str) -> list[str]:
@@ -1248,14 +1280,82 @@ class Storage:
                 (code, year, year_type)).fetchone()
         return row is not None
 
-    def put_adjust_factors(self, code: str, rows: list[dict[str, Any]]):
+    def put_adjust_factors(self, code: str, rows: list[dict[str, Any]],
+                           adjust_flag: str = "backward", source: str = "baostock",
+                           algorithm_version: str = "adj-v1"):
+        """D-02: 写复权因子（统一 effective_date），并记录版本到 adjust_factor_versions。
+
+        兼容旧数据：因子行若有 dividOperateDate 或 date 作为 effective_date；
+        同时写 factor_date（兼容旧读取）。相同 code+effective_date+观察时间幂等。
+        """
+        from .adjustment import FactorAdapter
+        from .standard import SOURCE_BAOSTOCK
         now = self.clock.now_utc().isoformat()
-        values = [(code, r.get("date", ""), json.dumps(r, ensure_ascii=False), now) for r in rows if r.get("date")]
+        adapter = FactorAdapter()
+        values = []
+        versions = []
+        for raw in rows:
+            f = adapter.map_row(raw)
+            if f is None:
+                continue
+            eff = f.effective_date
+            payload = json.dumps(f.to_payload(), ensure_ascii=False)
+            values.append((code, eff, payload, now, eff, adjust_flag,
+                           source or SOURCE_BAOSTOCK, algorithm_version))
+            versions.append((code, eff, now, adjust_flag, source or SOURCE_BAOSTOCK,
+                             algorithm_version, payload))
         if not values:
             return
         with self._session() as db:
-            db.executemany("""INSERT OR REPLACE INTO adjust_factors(code, factor_date, payload, fetched_at)
-                VALUES (?, ?, ?, ?)""", values)
+            db.executemany("""INSERT OR REPLACE INTO adjust_factors
+                (code, factor_date, payload, fetched_at,
+                 effective_date, adjust_flag, source, algorithm_version)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)""", values)
+            db.executemany("""INSERT OR REPLACE INTO adjust_factor_versions
+                (code, effective_date, observed_at, adjust_flag, source,
+                 algorithm_version, payload)
+                VALUES (?, ?, ?, ?, ?, ?, ?)""", versions)
+
+    def get_adjust_factors(self, code: str,
+                           adjust_flag: str | None = None) -> list[dict[str, Any]]:
+        """读取复权因子（按 effective_date 升序）；返回标准 payload 字典。"""
+        with self._session() as db:
+            if adjust_flag:
+                rows = db.execute(
+                    """SELECT payload FROM adjust_factors
+                       WHERE code=? AND adjust_flag=? ORDER BY effective_date""",
+                    (code, adjust_flag)).fetchall()
+            else:
+                rows = db.execute(
+                    """SELECT payload FROM adjust_factors
+                       WHERE code=? ORDER BY effective_date""", (code,)).fetchall()
+        out = []
+        for (payload,) in rows:
+            try:
+                out.append(json.loads(payload))
+            except json.JSONDecodeError:
+                continue
+        return out
+
+    def get_adjust_factor_versions(self, code: str, effective_date: str | None = None
+                                   ) -> list[dict[str, Any]]:
+        """读取复权因子版本序列（可追溯）。"""
+        with self._session() as db:
+            if effective_date:
+                rows = db.execute(
+                    """SELECT code, effective_date, observed_at, adjust_flag, source,
+                              algorithm_version, payload
+                       FROM adjust_factor_versions WHERE code=? AND effective_date=?
+                       ORDER BY observed_at""", (code, effective_date)).fetchall()
+            else:
+                rows = db.execute(
+                    """SELECT code, effective_date, observed_at, adjust_flag, source,
+                              algorithm_version, payload
+                       FROM adjust_factor_versions WHERE code=? ORDER BY effective_date, observed_at""",
+                    (code,)).fetchall()
+        keys = ("code", "effective_date", "observed_at", "adjust_flag", "source",
+                "algorithm_version", "payload")
+        return [dict(zip(keys, row)) for row in rows]
 
     def put_stock_industry(self, rows: list[dict[str, Any]]):
         now = self.clock.now_utc().isoformat()
