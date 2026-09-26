@@ -1,5 +1,22 @@
 # baostock-runner
 
+## E/F 本地查询与研究接口
+
+同一进程提供 `/mcp`、`/dashboard/`、`/api/*`、`/healthz`、`/readyz`。API 默认要求
+`BAOSTOCK_HTTP_TOKEN`，控制台右上角输入令牌后以 Bearer 头发送；仅显式设置
+`BAOSTOCK_HTTP_DEV_MODE=true` 且请求来自本机回环地址时允许免令牌。
+`/healthz` 检查本地数据库与任务服务，`/readyz` 表示本地查询可服务，均单独报告上游状态。
+
+`GET /api/stocks`、`GET /api/stocks/{code}/daily`、`GET /api/stocks/{code}/financials`
+默认游标分页 500 行，`limit` 上限 5000；`POST /api/stocks/{code}/daily/refresh`
+返回 202 与 `job_id`，`GET /api/jobs/{job_id}` 查询进度。研究接口包括
+`PUT /api/research/watchlist`、`POST /api/research/universes`、`POST /api/research/screens`、
+`POST /api/research/backtests` 与 `/api/research/export/{kind}/{run_id}`。
+筛选默认 `baseline_v1`，固定池会标记幸存者偏差；证据不足时严格时点模式拒绝运行。
+回测使用后复权价格近似收益，要求显式涨跌停边界；未知边界当日不成交，并保留原因。
+运行保存完整输入快照、规则、交易假设及结果；生产外部验收另行记录。
+schema v7–v9 增加研究任务与结果、行情旧版本及财务首次观察版本；历史迁移前未保存的观察时间保持未知，不能凭迁移后的数据声明严格时点证据。
+
 面向 NAS/Docker 的 BaoStock 数据服务：以 Streamable HTTP 提供 MCP 工具，后台线程把股票数据分批次下载到本地 SQLite 形成持久缓存，MCP 读取优先命中本地、不重复消耗 BaoStock 配额。
 
 外部 MCP 请求可以并发到达，但 BaoStock 访问始终由**同一个 Python 进程内的单 worker、单连接、串行队列**执行（BaoStock 官方限制：非线程安全，多会话直连有封号风险）。

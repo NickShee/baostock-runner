@@ -24,6 +24,8 @@ services:
       BAOSTOCK_MCP_HOST: 0.0.0.0
       BAOSTOCK_MCP_PORT: "8000"
       BAOSTOCK_MCP_PATH: /mcp
+      BAOSTOCK_HTTP_TOKEN: ${BAOSTOCK_HTTP_TOKEN:-}
+      BAOSTOCK_HTTP_DEV_MODE: ${BAOSTOCK_HTTP_DEV_MODE:-false}
       # True = stateless Streamable HTTP. Avoids "Session not found" 404 disconnects
       # when the client reconnects after the stateful session idle timeout.
       BAOSTOCK_MCP_STATELESS: ${BAOSTOCK_MCP_STATELESS:-true}

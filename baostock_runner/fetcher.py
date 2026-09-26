@@ -95,7 +95,8 @@ class Fetcher:
 
     def wake(self, dataset: str = ""):
         """立即唤醒一次调度循环（供 start_backfill MCP 工具使用）。"""
-        if dataset:
+        if dataset and dataset != "auto":
+            self._requested_dataset = dataset
             self._set_state(dataset=dataset)
         self.wake_event.set()
 
@@ -164,6 +165,20 @@ class Fetcher:
         轮询类任务（日线/财务/分红/复权）逐个尝试，任何一个做了活就返回 True，
         避免因某类任务暂时无活而短路掉后续阶段（如日线完成后必须继续财务）。
         """
+        requested = getattr(self, "_requested_dataset", None)
+        if requested:
+            self._requested_dataset = None
+            methods = {
+                "securities": self._fetch_universe_init,
+                "calendar": self._fetch_calendar,
+                "industry": self._fetch_industry,
+                "index_constituents": self._fetch_index,
+                "daily_bars": self._fetch_daily_batch,
+                "financials": self._fetch_financial_batch,
+                "dividends": self._fetch_dividends_batch,
+                "adjust_factors": self._fetch_adjust_factors_batch,
+            }
+            return methods[requested]()
         if self._need_universe_init():
             return self._fetch_universe_init()
         if self._need_calendar():

@@ -16,7 +16,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
 WORKDIR /app
-COPY requirements.txt requirements.lock* .
+COPY requirements.txt requirements.lock* ./
 # 优先使用精确锁定文件（ENV-01：固定已验证依赖版本），缺失时退回范围约束。
 RUN if [ -f requirements.lock ]; then \
         http_proxy="${HTTP_PROXY}" https_proxy="${HTTPS_PROXY}" \

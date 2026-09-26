@@ -1,4 +1,5 @@
 import json
+import hashlib
 import os
 import sqlite3
 import threading
@@ -8,10 +9,10 @@ from typing import Any, Callable
 
 from .timeutil import Clock
 
-# B-01: schema 版本。当前最新版本为 6。
+# B-01: schema 版本。当前最新版本为 9。
 # 迁移采用顺序执行：旧库（user_version < SCHEMA_VERSION）逐版本升级；
 # 未知更高版本（user_version > SCHEMA_VERSION）启动时拒绝写入，防止旧代码破坏新库。
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 9
 
 # A-03: 任务状态机。
 JOB_PENDING = "pending"
@@ -197,6 +198,52 @@ MIGRATIONS: dict[int, list[Any]] = {
             algorithm_version TEXT,
             payload TEXT NOT NULL,
             PRIMARY KEY(code, effective_date, observed_at, adjust_flag))""",
+    ],
+    # E/F: durable local query jobs and reproducible research inputs/results.
+    7: [
+        """CREATE TABLE IF NOT EXISTS app_jobs (
+            job_id TEXT PRIMARY KEY, kind TEXT NOT NULL, status TEXT NOT NULL,
+            request_json TEXT NOT NULL, result_json TEXT, error TEXT,
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL)""",
+        """CREATE TABLE IF NOT EXISTS watchlists (
+            name TEXT NOT NULL, code TEXT NOT NULL, added_at TEXT NOT NULL,
+            PRIMARY KEY(name, code))""",
+        """CREATE TABLE IF NOT EXISTS universe_snapshots (
+            snapshot_id TEXT PRIMARY KEY, asof_date TEXT NOT NULL,
+            source TEXT NOT NULL, observed_at TEXT NOT NULL,
+            codes_json TEXT NOT NULL, quality TEXT NOT NULL)""",
+        """CREATE TABLE IF NOT EXISTS screen_run (
+            run_id TEXT PRIMARY KEY, asof_date TEXT NOT NULL, mode TEXT NOT NULL,
+            rule_version TEXT NOT NULL, quality TEXT NOT NULL,
+            universe_json TEXT NOT NULL, inputs_json TEXT NOT NULL,
+            parameters_json TEXT NOT NULL, created_at TEXT NOT NULL)""",
+        """CREATE TABLE IF NOT EXISTS screen_result (
+            run_id TEXT NOT NULL, code TEXT NOT NULL, rank INTEGER,
+            status TEXT NOT NULL, reasons_json TEXT NOT NULL,
+            factors_json TEXT NOT NULL, PRIMARY KEY(run_id, code))""",
+        """CREATE VIEW IF NOT EXISTS candidate_pool AS
+            SELECT run_id, code, rank, factors_json FROM screen_result
+            WHERE status='selected'""",
+        """CREATE TABLE IF NOT EXISTS backtest_run (
+            run_id TEXT PRIMARY KEY, screen_run_id TEXT NOT NULL,
+            status TEXT NOT NULL, quality TEXT NOT NULL,
+            assumptions_json TEXT NOT NULL, result_json TEXT NOT NULL,
+            created_at TEXT NOT NULL)""",
+    ],
+    8: [
+        """CREATE TABLE IF NOT EXISTS daily_bar_versions (
+            code TEXT NOT NULL, bar_date TEXT NOT NULL, frequency TEXT NOT NULL,
+            adjustflag TEXT NOT NULL, observed_at TEXT NOT NULL, payload TEXT NOT NULL,
+            PRIMARY KEY(code, bar_date, frequency, adjustflag, observed_at))""",
+        "CREATE INDEX IF NOT EXISTS idx_daily_bar_versions_asof ON daily_bar_versions(code, frequency, adjustflag, bar_date, observed_at)",
+    ],
+    9: [
+        """CREATE TABLE IF NOT EXISTS financial_versions (
+            dataset TEXT NOT NULL, code TEXT NOT NULL, year INTEGER NOT NULL,
+            quarter INTEGER NOT NULL, payload_hash TEXT NOT NULL,
+            first_observed_at TEXT NOT NULL, payload TEXT NOT NULL,
+            PRIMARY KEY(dataset, code, year, quarter, payload_hash))""",
+        "CREATE INDEX IF NOT EXISTS idx_fin_versions_asof ON financial_versions(dataset, code, first_observed_at)",
     ],
 }
 
@@ -627,6 +674,26 @@ class Storage:
                 "tradestatus", "isST", "peTTM", "pbMRQ", "psTTM", "pcfNcfTTM")
         return [dict(zip(keys, row)) for row in rows]
 
+    def get_daily_bars_asof(self, code: str, frequency: str, adjustflag: str,
+                            start_date: str, end_date: str, observed_on_or_before: str) -> list[dict[str, Any]]:
+        """Reconstruct the latest version actually observed by a historical date."""
+        with self._session() as db:
+            rows = db.execute("""SELECT bar_date,raw_json,updated_at FROM daily_bars
+                WHERE code=? AND frequency=? AND adjustflag=? AND bar_date BETWEEN ? AND ?""",
+                (code, frequency, adjustflag, start_date, end_date)).fetchall()
+            versions = db.execute("""SELECT bar_date,payload,observed_at FROM daily_bar_versions
+                WHERE code=? AND frequency=? AND adjustflag=? AND bar_date BETWEEN ? AND ?
+                ORDER BY observed_at""", (code, frequency, adjustflag, start_date, end_date)).fetchall()
+        chosen = {}
+        for d, raw, observed in versions + rows:
+            if observed[:10] <= observed_on_or_before:
+                prior = chosen.get(d)
+                if prior is None or prior[0] < observed:
+                    payload = json.loads(raw) if raw else {}
+                    payload.update({"date": d, "code": code, "frequency": frequency, "adjustflag": adjustflag})
+                    chosen[d] = (observed, payload)
+        return [chosen[d][1] for d in sorted(chosen)]
+
     def latest_daily_bar(self, code: str, frequency: str, adjustflag: str) -> str | None:
         with self._session() as db:
             row = db.execute(
@@ -674,11 +741,28 @@ class Storage:
                 json.dumps(merged, ensure_ascii=False), now,
             ))
         with self._session() as db:
+            current = {}
+            if values:
+                for r in db.execute("""SELECT bar_date,open,high,low,close,preclose,volume,amount,pct_chg,turn,
+                        tradestatus,isST,peTTM,pbMRQ,psTTM,pcfNcfTTM,raw_json,updated_at FROM daily_bars
+                        WHERE code=? AND frequency=? AND adjustflag=? AND bar_date BETWEEN ? AND ?""",
+                        (code, frequency, adjustflag, min(v[1] for v in values), max(v[1] for v in values))):
+                    current[r[0]] = r[1:]
+            changed = []
+            for value in values:
+                old = current.get(value[1])
+                if old is not None and tuple(old[:15]) == tuple(value[4:19]):
+                    continue
+                if old is not None:
+                    db.execute("""INSERT OR IGNORE INTO daily_bar_versions
+                        (code,bar_date,frequency,adjustflag,observed_at,payload) VALUES (?,?,?,?,?,?)""",
+                        (code, value[1], frequency, adjustflag, old[16], old[15] or "{}"))
+                changed.append(value)
             db.executemany("""INSERT OR REPLACE INTO daily_bars
                 (code, bar_date, frequency, adjustflag, open, high, low, close,
                  preclose, volume, amount, pct_chg, turn, tradestatus, isST,
                  peTTM, pbMRQ, psTTM, pcfNcfTTM, raw_json, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", values)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", changed)
 
     @staticmethod
     def _number(value):
@@ -722,8 +806,9 @@ class Storage:
                           preclose, peTTM, pbMRQ, psTTM, pcfNcfTTM, tradestatus
                    FROM daily_bars
                    WHERE frequency=? AND adjustflag=?
-                     AND bar_date BETWEEN ? AND ?""",
-                (frequency, adjustflag, start_date, end_date)).fetchall()
+                     AND bar_date BETWEEN ? AND ?
+                     AND code IN (""" + ",".join("?" for _ in codes) + ")",
+                (frequency, adjustflag, start_date, end_date, *codes)).fetchall()
             for r in rows:
                 actual.setdefault(r[0], {})[r[1]] = {
                     "market": any(self._number(x) is not None for x in
@@ -1009,6 +1094,18 @@ class Storage:
             (dataset, batch_id, status, error, now, next_retry_at, rows_written, error_class))
 
     @staticmethod
+    def _record_financial_version(db: sqlite3.Connection, dataset: str, code: str,
+                                  year: int, quarter: int, payload: str, observed_at: str):
+        normalized = json.dumps(json.loads(payload), ensure_ascii=False, sort_keys=True)
+        digest = hashlib.sha256(normalized.encode()).hexdigest()
+        db.execute("""INSERT INTO financial_versions
+            (dataset,code,year,quarter,payload_hash,first_observed_at,payload)
+            VALUES (?,?,?,?,?,?,?)
+            ON CONFLICT(dataset,code,year,quarter,payload_hash) DO UPDATE SET
+                first_observed_at=MIN(financial_versions.first_observed_at, excluded.first_observed_at)""",
+            (dataset, code, year, quarter, digest, observed_at, payload))
+
+    @staticmethod
     def _put_financials_in_txn(db: sqlite3.Connection, dataset: str, code: str,
                                year: int, quarter: int, payload: dict[str, Any],
                                fetched_at: str | None = None):
@@ -1026,6 +1123,7 @@ class Storage:
             "SELECT payload, fetched_at FROM financials WHERE dataset=? AND code=? AND year=? AND quarter=?",
             (dataset, code, year, quarter)).fetchone()
         if old is not None:
+            Storage._record_financial_version(db, dataset, code, year, quarter, old[0], old[1])
             old_payload = old[0]
             if old_payload != json.dumps(payload, ensure_ascii=False):
                 rev = db.execute(
@@ -1035,10 +1133,12 @@ class Storage:
                     (dataset, code, year, quarter, revision, payload, fetched_at)
                     VALUES (?, ?, ?, ?, ?, ?, ?)""",
                     (dataset, code, year, quarter, rev + 1, old_payload, old[1]))
+        new_payload = json.dumps(payload, ensure_ascii=False)
+        Storage._record_financial_version(db, dataset, code, year, quarter, new_payload, now)
         db.execute("""INSERT OR REPLACE INTO financials(dataset, code, year, quarter, payload, fetched_at,
                                                        pub_date, stat_date)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (dataset, code, year, quarter, json.dumps(payload, ensure_ascii=False), now, pub_date, stat_date))
+            (dataset, code, year, quarter, new_payload, now, pub_date, stat_date))
 
     # ---------- securities ----------
 
@@ -1185,8 +1285,11 @@ class Storage:
         if not values:
             return
         with self._session() as db:
-            db.executemany("""INSERT OR REPLACE INTO index_constituents
-                (index_code, asof_date, code, name, fetched_at) VALUES (?, ?, ?, ?, ?)""", values)
+            db.executemany("""INSERT INTO index_constituents
+                (index_code, asof_date, code, name, fetched_at) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(index_code,asof_date,code) DO UPDATE SET
+                    name=excluded.name,
+                    fetched_at=MIN(index_constituents.fetched_at, excluded.fetched_at)""", values)
 
     def get_index_codes(self, index_code: str, asof_date: str | None = None) -> list[str]:
         with self._session() as db:
@@ -1210,6 +1313,7 @@ class Storage:
                 "SELECT payload, fetched_at FROM financials WHERE dataset=? AND code=? AND year=? AND quarter=?",
                 (dataset, code, year, quarter)).fetchone()
             if old is not None:
+                self._record_financial_version(db, dataset, code, year, quarter, old[0], old[1])
                 old_payload = old[0]
                 if old_payload != json.dumps(payload, ensure_ascii=False):
                     rev = db.execute(
@@ -1219,8 +1323,10 @@ class Storage:
                         (dataset, code, year, quarter, revision, payload, fetched_at)
                         VALUES (?, ?, ?, ?, ?, ?, ?)""",
                         (dataset, code, year, quarter, rev + 1, old_payload, old[1]))
+            new_payload = json.dumps(payload, ensure_ascii=False)
+            self._record_financial_version(db, dataset, code, year, quarter, new_payload, now)
             db.execute("""INSERT OR REPLACE INTO financials(dataset, code, year, quarter, payload, fetched_at)
-                VALUES (?, ?, ?, ?, ?, ?)""", (dataset, code, year, quarter, json.dumps(payload, ensure_ascii=False), now))
+                VALUES (?, ?, ?, ?, ?, ?)""", (dataset, code, year, quarter, new_payload, now))
 
     def financial_exists(self, dataset: str, code: str, year: int, quarter: int) -> bool:
         with self._session() as db:
