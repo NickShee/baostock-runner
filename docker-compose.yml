@@ -91,7 +91,7 @@ services:
       # Offline mode: no network/credentials needed (dev / MCP line testing)
       BAOSTOCK_OFFLINE: ${BAOSTOCK_OFFLINE:-false}
     healthcheck:
-      test: ["CMD", "python", "-c", "import socket; s=socket.create_connection(('127.0.0.1', 8000), 3); s.close()"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3)"]
       interval: 300s
       timeout: 10s
       retries: 3

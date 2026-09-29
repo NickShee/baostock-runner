@@ -5,7 +5,6 @@ data/
 __pycache__/
 *.py[cod]
 .pytest_cache/
-docker-compose.yml
 
 # backup artifacts
 *bak*
