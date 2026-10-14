@@ -236,6 +236,10 @@ get_market_coverage()
   提升为可查询列（schema v2 迁移）；窄字段请求不覆盖旧值（字段级合并）；覆盖检查识别头部/中间/尾部
   缺口并合并为连续请求窗口；`get_stock_daily_bars(force_refresh=True)` 同时绕过参数缓存与事实表短路；
   覆盖结果区分 expected/effective/excluded/unknown，行情与估值字段分别统计。
+  日线缺口仅限上市日起、退市日前的交易日；逐股采集先补全池最近交易日窗口
+  （复用 `BAOSTOCK_DAILY_BATCH_WINDOW_DAYS`，默认 7 个交易日），再补历史缺口。
+  所有配置的复权口径分别检查实际缺口，旧成功标记不阻止新目标采集；空或不完整响应
+  进入 `waiting_data`，按空闲检查间隔（最少 60 秒）重试，不误报成功。
 - **A-03 可重查任务与财务修订**：任务状态机 `pending/running/succeeded/waiting_data/retryable_failed/permanent_failed`
   （schema v3）；空财报进入 `waiting_data` 按披露窗口重查（默认 24h）；最近两个已结束季度每日检查修订、
   其余报告每 30 天检查；网络失败指数退避（60s 起、最长 1h）；财务数据与作业完成状态同事务提交；

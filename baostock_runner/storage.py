@@ -821,14 +821,22 @@ class Storage:
                 "SELECT code, status, ipo_date, out_date FROM securities").fetchall()}
 
         # 应覆盖日期集：优先显式交易日历，否则退化为请求区间逐日（仅作兜底）
-        expected_dates = trade_dates or [
+        expected_dates = trade_dates if trade_dates is not None else [
             d for d in _date_range(start_date, end_date)
         ]
 
         for code in codes:
             sec = sec_rows.get(code)
             dates = set(actual.get(code, {}))
-            missing = [d for d in expected_dates if d not in dates]
+            ipo = (sec[2] or "") if sec is not None else ""
+            out = (sec[3] or "") if sec is not None else ""
+            # Only dates within the security's listing lifetime are collectible.
+            eligible_dates = [d for d in expected_dates
+                              if start_date <= d <= end_date
+                              and (not ipo or d >= ipo) and (not out or d < out)]
+            if sec is not None and sec[1] == "D":
+                eligible_dates = []
+            missing = [d for d in eligible_dates if d not in dates]
             gaps = _merge_date_windows(missing) if missing else []
 
             # 状态判定：合法排除优先；无证券记录/无法判断历史状态 → unknown
@@ -1472,6 +1480,43 @@ class Storage:
         with self._session() as db:
             db.executemany("""INSERT OR REPLACE INTO stock_industry
                 (code, industry, classification, update_date, fetched_at) VALUES (?, ?, ?, ?, ?)""", values)
+
+    def get_daily_gap_codes(self, limit: int, start_date: str, end_date: str,
+                            adjustflags: list[str]) -> list[str]:
+        """Select actual calendar gaps in any requested adjustment, respecting retry time.
+
+        Job success is not evidence of coverage. In particular, a morning success
+        must not suppress a new target after the evening collection time.
+        """
+        if not adjustflags:
+            return []
+        flags_sql = " UNION ALL ".join("SELECT ? AS adjustflag" for _ in adjustflags)
+        with self._session() as db:
+            rows = db.execute("""
+                SELECT s.code FROM securities s
+                WHERE s.status IN ('', '1')
+                  AND EXISTS (
+                    SELECT 1 FROM (""" + flags_sql + """) f
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM download_jobs j
+                        WHERE j.dataset='daily_bars'
+                          AND j.batch_id=s.code || '|' || f.adjustflag
+                          AND j.status IN ('waiting_data', 'retryable_failed')
+                          AND j.window_end=? AND j.next_retry_at>?)
+                      AND EXISTS (
+                        SELECT 1 FROM trade_calendar t
+                        WHERE t.is_trading_day=1
+                          AND t.calendar_date BETWEEN ? AND ?
+                          AND (s.ipo_date IS NULL OR s.ipo_date='' OR t.calendar_date>=s.ipo_date)
+                          AND (s.out_date IS NULL OR s.out_date='' OR t.calendar_date<s.out_date)
+                          AND NOT EXISTS (
+                            SELECT 1 FROM daily_bars b
+                            WHERE b.code=s.code AND b.bar_date=t.calendar_date
+                              AND b.frequency='d' AND b.adjustflag=f.adjustflag)))
+                ORDER BY s.code LIMIT ?""",
+                (*adjustflags, end_date, self.clock.now_utc().isoformat(),
+                 start_date, end_date, limit)).fetchall()
+        return [r[0] for r in rows]
 
     # ---------- daily backfill pending selection (断点续传 + 当日去重) ----------
 

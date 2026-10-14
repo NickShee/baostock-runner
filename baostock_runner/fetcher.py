@@ -9,8 +9,7 @@
 - 断点续传：download_jobs 表记录每个 (dataset, batch_id) 的状态；
   已 done 的批次重启后自动跳过。
 - 幂等：所有事实表使用复合主键 + INSERT OR REPLACE，可重复执行。
-- 日线"当日去重"：今天已 done 的股票当天不再重复拉取，跨天自动重新检查
-  （实现每日增量）。
+- 日线按交易日历及上市区间核对实际缺口；优先全池近期行情，空结果延迟重试。
 """
 
 import datetime
@@ -537,50 +536,60 @@ class Fetcher:
     def _fetch_daily_batch(self) -> bool:
         latest = self._latest_trade_date()
         adjustflags = self._adjustflags()
-        pending = self.storage.get_daily_pending_codes(
-            limit=self.settings.fetch_batch_size,
-            end_date=latest,
-            primary_adjustflag=adjustflags[0],
-        )
+        start = self.settings.fetch_daily_start_date
+        trade_dates = self._trade_dates_in_range(start, latest)
+        if not trade_dates:
+            return False  # Calendar initialization must precede collection.
+
+        # Update the whole pool's recent trading days before historical backfill.
+        recent_start = trade_dates[-min(len(trade_dates), max(1, self.settings.daily_batch_window_days))]
+        pending = self.storage.get_daily_gap_codes(
+            self.settings.fetch_batch_size, recent_start, latest, adjustflags)
+        scope_start = recent_start
+        if not pending:
+            scope_start = start
+            pending = self.storage.get_daily_gap_codes(
+                self.settings.fetch_batch_size, start, latest, adjustflags)
         if not pending:
             return False
+
+        scope_dates = [d for d in trade_dates if d >= scope_start]
         self._set_state(current=f"daily backfill: {len(pending)} codes", dataset="daily_bars",
                         total=len(pending), done=0)
-        done = 0
+        did_work = False
         for code in pending:
-            if self.budget_left() <= 0:
-                raise BudgetExhausted()
             for af in adjustflags:
-                # A-02：按缺口窗口补齐（头部/中间/尾部），不预生成全市场历史笛卡尔积。
-                # 用本地交易日历判断应覆盖日期，把缺口合并为连续请求窗口逐段请求。
-                trade_dates = self._trade_dates_in_range(
-                    self.settings.fetch_daily_start_date, latest)
+                job_id = f"{code}|{af}"
+                job = self.storage._job_row("daily_bars", job_id)
+                if (job and job["status"] in (self.storage.JOB_WAITING_DATA, self.storage.JOB_RETRYABLE_FAILED)
+                        and job["window_end"] == latest and job["next_retry_at"]
+                        and job["next_retry_at"] > self.clock.now_utc().isoformat()):
+                    continue
                 coverage = self.storage.get_daily_coverage(
-                    [code], self.settings.fetch_daily_start_date, latest, af,
-                    trade_dates=trade_dates)
+                    [code], scope_start, latest, af, trade_dates=scope_dates)
                 gaps = coverage["per_code"][code]["gap_windows"]
-                # 回退：本地交易日历缺失时（异常），按整个请求区间作为一个窗口补齐。
-                if not gaps and not trade_dates:
-                    gaps = [{"start": self.settings.fetch_daily_start_date,
-                             "end": latest, "days": 0}]
-                if gaps:
-                    for win in gaps:
-                        if self.budget_left() <= 0:
-                            raise BudgetExhausted()
-                        self.gateway.daily_bars({
-                            "code": code,
-                            "fields": DAILY_FIELDS,
-                            "start_date": win["start"],
-                            "end_date": win["end"],
-                            "frequency": "d",
-                            "adjustflag": af,
-                        }, use_cache=False, priority=1, origin="fetcher")
-                # 无缺口时无需请求；仍记录 job（用于当日去重/断点续传）。
-                self.storage.job_upsert("daily_bars", f"{code}|{af}", self.storage.JOB_SUCCEEDED)
-            done += 1
-            self._set_state(done=done)
-        self._set_state(current=f"daily backfill batch done: {done} codes")
-        return True
+                for win in gaps:
+                    if self.budget_left() <= 0:
+                        raise BudgetExhausted()
+                    # Request the exact missing window, including historical holes
+                    # even when a newer bar already exists locally.
+                    self.gateway.daily_bars({
+                        "code": code, "fields": DAILY_FIELDS,
+                        "start_date": win["start"], "end_date": win["end"],
+                        "frequency": "d", "adjustflag": af,
+                    }, use_cache=False, force_refresh=True, priority=1, origin="fetcher")
+                    did_work = True
+                remaining = self.storage.get_daily_coverage(
+                    [code], scope_start, latest, af, trade_dates=scope_dates)
+                incomplete = bool(remaining["per_code"][code]["gap_windows"])
+                retry_at = (self.clock.now_utc() + datetime.timedelta(
+                    seconds=max(60, self.settings.fetch_idle_sleep_seconds))).isoformat() if incomplete else None
+                self.storage.job_upsert(
+                    "daily_bars", job_id,
+                    self.storage.JOB_WAITING_DATA if incomplete else self.storage.JOB_SUCCEEDED,
+                    window_start=scope_start, window_end=latest, next_retry_at=retry_at)
+            self._set_state(done=self.state["done"] + 1)
+        return did_work
 
     def _trade_dates_in_range(self, start_date: str, end_date: str) -> list[str]:
         """读取本地交易日历在 [start, end] 内的交易日列表（用于覆盖检查）。"""
