@@ -152,6 +152,71 @@ class GatewayTest(unittest.TestCase):
         else:
             sys.modules["baostock"] = saved
 
+    def test_startup_network_failure_recovers_without_restarting_worker(self):
+        retry_started = threading.Event()
+        allow_login = threading.Event()
+
+        class FlakyLogin(_FakeBS):
+            def login(self, user_id="", password=""):
+                self.login_count += 1
+                if self.login_count == 1:
+                    return _FakeResult(error_code="10002007", error_msg="network receive error")
+                retry_started.set()
+                if not allow_login.wait(5):
+                    raise AssertionError("test did not release startup retry")
+                return _FakeResult()
+
+        fake = FlakyLogin()
+        self._install_fake_baostock(fake)
+        with tempfile.TemporaryDirectory() as directory:
+            settings = Settings(db_path=os.path.join(directory, "data.sqlite3"),
+                                log_path=os.path.join(directory, "audit.jsonl"),
+                                min_interval_seconds=0, retry_delays=(1,),
+                                verify_after_login=True, offline=False)
+            gateway = BaoStockGateway(settings)
+            params = {"code": "sh.600519", "start_date": "2026-11-03"}
+            try:
+                with self.assertRaisesRegex(ReconnectableFailure, "10002007"):
+                    gateway.call("query_history_k_data_plus", params)
+                self.assertTrue(retry_started.wait(5))
+                self.assertTrue(gateway.health_status()["worker_alive"])
+                self.assertFalse(gateway.health_status()["ready"])
+                self.assertTrue(gateway.health_status()["busy"])
+                allow_login.set()
+                deadline = time.monotonic() + 5
+                while not gateway.health_status()["ready"] and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                result = gateway.call("query_history_k_data_plus", params)
+                self.assertEqual(result["data"][0]["date"], "2026-11-03")
+                self.assertEqual(fake.login_count, 2)
+                self.assertEqual(gateway.storage.usage_today(), 4)
+            finally:
+                allow_login.set()
+                gateway.close()
+
+    def test_startup_blacklist_stops_login_retries(self):
+        class BlacklistedLogin(_FakeBS):
+            def login(self, user_id="", password=""):
+                self.login_count += 1
+                return _FakeResult(error_code="10001011", error_msg="blacklisted")
+
+        fake = BlacklistedLogin()
+        self._install_fake_baostock(fake)
+        with tempfile.TemporaryDirectory() as directory:
+            settings = Settings(db_path=os.path.join(directory, "data.sqlite3"),
+                                log_path=os.path.join(directory, "audit.jsonl"),
+                                offline=False)
+            gateway = BaoStockGateway(settings)
+            try:
+                with self.assertRaisesRegex(RuntimeError, "10001011"):
+                    gateway.call("query_history_k_data_plus", {})
+                gateway.worker.join(timeout=2)
+                self.assertFalse(gateway.worker.is_alive())
+                self.assertTrue(gateway.health_status()["circuit_breaker_open"])
+                self.assertEqual(fake.login_count, 1)
+            finally:
+                gateway.close()
+
     def test_stale_session_reconnects_before_query(self):
         fake = _FakeBS()
         self._install_fake_baostock(fake)

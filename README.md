@@ -116,6 +116,8 @@ BaoStock 免费长连接在服务端空闲超时或波动时会静默断开。�
 | `BAOSTOCK_RECONNECT_ON_FAILURE` | `true` | 查询失败（非黑名单）且重试耗尽后，重连一次再试 |
 | `BAOSTOCK_VERIFY_AFTER_LOGIN` | `true` | 登录后用 `query_stock_basic` 轻量验证通道真实可用 |
 
+启动时遇到上游网络错误，Gateway 保留本地查询能力，并按 `BAOSTOCK_RETRY_DELAYS_SECONDS` 退避重试登录（用完后沿用最后一个间隔）。登录及验证成功后自动恢复采集；账号配置错误、黑名单等非网络错误仍需人工处理。
+
 ## Worker 心跳看门狗（v0.10.x+）
 
 gateway 单 worker 在 BaoStock 半开连接下可能卡进 `rs.next()` 用户态死循环：

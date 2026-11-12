@@ -17,6 +17,9 @@ from .timeutil import Clock
 
 
 BLACKLIST_CODE = "10001011"
+# BaoStock SDK socket, connect, send, and receive errors. Authentication and
+# other service errors are terminal during startup.
+LOGIN_NETWORK_CODES = frozenset(str(code) for code in range(10002001, 10002009))
 # 网络层异常：连接被重置/超时/拒绝。出现这类异常时应重连而非盲目重试原会话。
 RECONNECTABLE_NETWORK_EXC = (ConnectionError, socket.timeout, BrokenPipeError, OSError)
 
@@ -80,7 +83,7 @@ class BaoStockGateway:
         # worker 心跳：worker 每处理一个 Job（以及大数据量遍历中定期）刷新。
         # watchdog 线程发现心跳停滞超过阈值即终止进程，由容器 restart 自动拉起。
         self.last_heartbeat = time.monotonic()
-        # 忙碌标志：仅当 worker 正在执行 Job 时才认为"应当在刷新心跳"。
+        # 忙碌标志：仅在上游登录或执行 Job 时才要求刷新心跳。
         # 空闲（队列为空）是正常状态而非卡死，否则 watchdog 会周期性误杀空闲进程。
         self._busy = False
         self.worker = threading.Thread(target=self._worker, name="baostock-single-worker", daemon=True)
@@ -126,8 +129,9 @@ class BaoStockGateway:
             raise RuntimeError("BaoStock gateway is shutting down")
         if not self.ready.wait(timeout=min(15, max(0.001, deadline - time.monotonic()))):
             raise TimeoutError("BaoStock worker did not become ready before the request deadline")
-        if self.startup_error is not None:
-            raise self.startup_error
+        startup_error = self.startup_error
+        if startup_error is not None:
+            raise startup_error
         if self.breaker.is_set():
             raise RuntimeError("BaoStock circuit breaker is open; manual intervention required")
         key = hashlib.sha256(json.dumps({"method": method, "params": params}, sort_keys=True).encode()).hexdigest()
@@ -268,23 +272,9 @@ class BaoStockGateway:
                     raise RuntimeError("BAOSTOCK_USER_ID and BAOSTOCK_PASSWORD must be provided together")
                 import baostock as bs_module
                 bs = bs_module
-                self._record_attempt("session_login", {}, "login")
-                login = (
-                    bs.login(user_id=self.settings.user_id, password=self.settings.password)
-                    if self.settings.user_id
-                    else bs.login()
-                )
-                if login.error_code != "0":
-                    if login.error_code == BLACKLIST_CODE:
-                        self.breaker.set()
-                    raise RuntimeError(f"BaoStock login failed: {login.error_code} {login.error_msg}")
-                logged_in = True
-                self.last_activity = time.monotonic()
-                if self.settings.verify_after_login:
-                    self._record_attempt("query_stock_basic", {"code": "sh.000001"}, "login_verification")
-                    verification = bs.query_stock_basic(code="sh.000001")
-                    if verification.error_code != "0":
-                        raise RuntimeError(f"BaoStock post-login verification failed: {verification.error_code} {verification.error_msg}")
+                logged_in = self._login_at_startup(bs)
+                if not logged_in:
+                    return
             self.ready.set()
             while True:
                 try:
@@ -327,6 +317,59 @@ class BaoStockGateway:
             if logged_in and bs is not None:
                 bs.logout()
 
+    def _login_at_startup(self, bs) -> bool:
+        """Retry transient failures in the single worker while SQLite stays available."""
+        delays = self.settings.retry_delays or (5, 30, 120)
+        attempt = 0
+        while not self.stop_event.is_set():
+            logged_in = False
+            self._beat()
+            self._busy = True
+            try:
+                self._record_attempt("session_login", {}, "login")
+                login = (bs.login(user_id=self.settings.user_id, password=self.settings.password)
+                         if self.settings.user_id else bs.login())
+                self._check_startup_response(login, "login")
+                logged_in = True
+                if self.settings.verify_after_login:
+                    self._beat()
+                    self._record_attempt("query_stock_basic", {"code": "sh.000001"}, "login_verification")
+                    self._check_startup_response(bs.query_stock_basic(code="sh.000001"), "post-login verification")
+                self.last_activity = time.monotonic()
+                self.startup_error = None
+                return True
+            except Exception as exc:
+                if logged_in:
+                    try:
+                        bs.logout()
+                    except Exception:
+                        pass
+                if not isinstance(exc, (ReconnectableFailure, *RECONNECTABLE_NETWORK_EXC)):
+                    raise
+                self.startup_error = exc
+                self.ready.set()  # Let upstream callers fail promptly until a retry succeeds.
+            finally:
+                self._busy = False
+            delay = max(1, delays[min(attempt, len(delays) - 1)])
+            self.storage.audit({"interface": "gateway_startup", "origin": "maintenance",
+                                "request_id": "gateway-session", "status": "retrying",
+                                "retry_in_seconds": delay, "error": str(self.startup_error)[:1000]},
+                               self.settings.audit_log_max_bytes)
+            attempt += 1
+            self.stop_event.wait(delay)
+        return False
+
+    def _check_startup_response(self, response, operation: str) -> None:
+        code = response.error_code
+        if code == "0":
+            return
+        if code == BLACKLIST_CODE:
+            self.breaker.set()
+        message = f"BaoStock {operation} failed: {code} {response.error_msg}"
+        if code in LOGIN_NETWORK_CODES:
+            raise ReconnectableFailure(message)
+        raise RuntimeError(message)
+
     def _beat(self):
         """刷新 worker 心跳（watchdog 据此判断 worker 是否卡死）。"""
         self.last_heartbeat = time.monotonic()
@@ -336,7 +379,7 @@ class BaoStockGateway:
         timeout = max(30, self.settings.watchdog_timeout_seconds)
         try:
             if not self._busy:
-                # worker 空闲等待 Job，心跳本来就不刷新，属正常状态。
+                # 等待任务或登录退避时，心跳无需刷新。
                 return False
             idle = time.monotonic() - self.last_heartbeat
             if idle > timeout:
