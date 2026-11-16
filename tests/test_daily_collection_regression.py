@@ -1,9 +1,11 @@
-"""Regression coverage for the production pre-IPO request exhaustion incident."""
+"""Regression coverage for daily collection gaps, retries and historical scans."""
+from dataclasses import replace
 import datetime
+import json
 import os
 import tempfile
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from baostock_runner.config import Settings
 from baostock_runner.fetcher import Fetcher
@@ -86,7 +88,7 @@ class DailyCollectionRegressionTest(unittest.TestCase):
         self.assertFalse(self.fetcher._fetch_daily_batch())
 
     def test_empty_response_waits_then_retries_instead_of_success(self):
-        self.seed('sh.600000', [])
+        self.seed('sh.600000', ['2026-09-21', '2026-09-22', '2026-09-23'])
         self.gateway.daily_bars.side_effect = lambda *a, **k: None
         self.assertTrue(self.fetcher._fetch_daily_batch())
         self.assertEqual(self.storage.job_status('daily_bars', 'sh.600000|1'), 'waiting_data')
@@ -95,6 +97,89 @@ class DailyCollectionRegressionTest(unittest.TestCase):
         self.gateway.daily_bars.assert_not_called()
         self.now += datetime.timedelta(minutes=6)
         self.assertTrue(self.fetcher._fetch_daily_batch())
+        self.assertEqual(self.gateway.daily_bars.call_count, 2)
+        self.now += datetime.timedelta(minutes=6)
+        restarted = Fetcher(self.gateway, self.settings)
+        self.assertFalse(restarted._fetch_daily_batch())
+        self.assertEqual(self.gateway.daily_bars.call_count, 2)
+        self.now += datetime.timedelta(minutes=4)
+        self.assertTrue(restarted._fetch_daily_batch())
+        self.assertEqual(self.gateway.daily_bars.call_count, 4)
+
+    def test_new_session_is_due_while_older_dates_remain_in_backoff(self):
+        settings = replace(self.settings, daily_batch_window_days=2)
+        self.fetcher = Fetcher(self.gateway, settings)
+        self.seed('sh.600000', ['2026-09-21', '2026-09-22'])
+        self.gateway.daily_bars.side_effect = lambda *a, **k: None
+        self.now = datetime.datetime.fromisoformat('2026-09-24T17:59:00+08:00')
+        self.assertTrue(self.fetcher._fetch_daily_batch())
+
+        self.now += datetime.timedelta(minutes=2)
+        self.gateway.daily_bars.reset_mock()
+        self.assertTrue(self.fetcher._fetch_daily_batch())
+        self.assertEqual(self.gateway.daily_bars.call_count, 2)
+        self.assertTrue(all(c.args[0]['start_date'] == '2026-09-24'
+                            for c in self.gateway.daily_bars.call_args_list))
+
+    def test_partial_response_only_backs_off_dates_still_missing(self):
+        self.fetcher = Fetcher(self.gateway, replace(self.settings, daily_batch_window_days=2))
+        self.seed('sh.600000', ['2026-09-21', '2026-09-22'], flags=('1',))
+        self.seed('sh.600000', ['2026-09-21', '2026-09-22', '2026-09-23', '2026-09-24'], flags=('3',))
+
+        def partial_download(params, **kwargs):
+            self.storage.put_daily_bars(params['code'], 'd', params['adjustflag'],
+                                        [{'date': '2026-09-23', 'close': '10'}])
+
+        self.gateway.daily_bars.side_effect = partial_download
+        self.assertTrue(self.fetcher._fetch_daily_batch())
+        with open(self.settings.log_path, encoding='utf-8') as log:
+            events = [json.loads(line) for line in log]
+        verification = next(event for event in events if event['interface'] == 'daily_bars_backfill')
+        self.assertEqual(verification['days_filled'], 1)
+        self.assertEqual(verification['remaining_dates'], ['2026-09-24'])
+
+        self.now += datetime.timedelta(minutes=6)
+        self.gateway.daily_bars.side_effect = self.download
+        self.assertTrue(self.fetcher._fetch_daily_batch())
+        self.assertEqual(self.gateway.daily_bars.call_count, 2)
+        self.assertEqual(self.gateway.daily_bars.call_args.args[0]['start_date'], '2026-09-24')
+        self.assertEqual(self.storage.job_status('daily_bars', 'sh.600000|1'), 'succeeded')
+        self.assertIsNone(self.storage.job_status('daily_bars_gap', 'sh.600000|1|2026-09-24'))
+
+    @patch('baostock_runner.fetcher.HISTORY_TRADE_DAYS', 1)
+    def test_history_is_throttled_and_resumes_code_and_date_after_restart(self):
+        self.seed('sh.600000', ['2026-09-22', '2026-09-23', '2026-09-24'])
+        self.seed('sz.000001', ['2026-09-23', '2026-09-24'])
+        self.assertTrue(self.fetcher._fetch_daily_batch())
+        self.assertEqual(self.gateway.daily_bars.call_args.args[0]['code'], 'sh.600000')
+
+        reopened = Storage(self.settings.db_path, self.settings.log_path, clock=self.clock)
+        self.gateway.storage = reopened
+        self.fetcher = Fetcher(self.gateway, self.settings)
+        self.assertFalse(self.fetcher._fetch_daily_batch())
+        self.now += datetime.timedelta(minutes=1)
+        self.assertTrue(self.fetcher._fetch_daily_batch())
+        self.assertEqual(self.gateway.daily_bars.call_args.args[0]['code'], 'sz.000001')
+        self.assertEqual(self.gateway.daily_bars.call_args.args[0]['start_date'], '2026-09-21')
+        self.now += datetime.timedelta(minutes=1)
+        self.assertFalse(self.fetcher._fetch_daily_batch())  # sh.600000 has September 22 already.
+        self.now += datetime.timedelta(minutes=1)
+        self.assertTrue(self.fetcher._fetch_daily_batch())
+        self.assertEqual(self.gateway.daily_bars.call_args.args[0]['code'], 'sz.000001')
+        self.assertEqual(self.gateway.daily_bars.call_args.args[0]['start_date'], '2026-09-22')
+
+    @patch('baostock_runner.fetcher.HISTORY_REQUEST_LIMIT', 1)
+    def test_history_resumes_same_slice_after_reaching_request_limit(self):
+        self.seed('sh.600000', ['2026-09-22', '2026-09-23', '2026-09-24'])
+        self.assertTrue(self.fetcher._fetch_daily_batch())
+        self.assertEqual(self.gateway.daily_bars.call_count, 1)
+        self.assertEqual(self.gateway.daily_bars.call_args.args[0]['adjustflag'], '1')
+        self.assertFalse(self.fetcher._fetch_daily_batch())
+        self.now += datetime.timedelta(minutes=1)
+        self.assertTrue(self.fetcher._fetch_daily_batch())
+        self.assertEqual(self.gateway.daily_bars.call_count, 2)
+        self.assertEqual(self.gateway.daily_bars.call_args.args[0]['adjustflag'], '3')
+        self.assertEqual(self.coverage('sh.600000')['status'], 'complete')
 
     def test_morning_success_does_not_suppress_evening_target(self):
         self.now = datetime.datetime.fromisoformat('2026-09-24T10:00:00+08:00')

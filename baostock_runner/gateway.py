@@ -569,7 +569,8 @@ class BaoStockGateway:
         job = self._active_job
         self.storage.audit({"interface": method, **p, "cache_hit": False, "request_count_today": count,
                             "error_code": "0", "origin": job.origin if job else "maintenance",
-                            "request_id": job.request_id if job else "gateway-session", "status": "query_succeeded"},
+                            "request_id": job.request_id if job else "gateway-session", "status": "query_succeeded",
+                            "rows_returned": len(rows)},
                            self.settings.audit_log_max_bytes)
         return payload
 

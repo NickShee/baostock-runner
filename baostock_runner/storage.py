@@ -4,8 +4,8 @@ import os
 import sqlite3
 import threading
 from contextlib import contextmanager
-from datetime import date, datetime, timezone
-from typing import Any, Callable
+from datetime import date, datetime, timedelta, timezone
+from typing import Any, Callable, NamedTuple
 
 from .timeutil import Clock
 
@@ -36,6 +36,11 @@ DAILY_FIELD_MAP = {
 DAILY_MARKET_FIELDS = ("open", "high", "low", "close", "preclose", "volume", "amount", "pctChg", "turn")
 # 估值字段：A-02 提升为可查询列。
 DAILY_VALUATION_FIELDS = ("peTTM", "pbMRQ", "psTTM", "pcfNcfTTM")
+
+
+class DailyGap(NamedTuple):
+    attempts: int
+    next_retry_at: str | None
 
 # 迁移定义：version -> 有序步骤列表。每步为 SQL 字符串或 callable(db)。
 # 步骤全部幂等（CREATE TABLE IF NOT EXISTS / ALTER TABLE ... IF 已存在检测），
@@ -1246,9 +1251,10 @@ class Storage:
                 "rows_written", "started_at", "finished_at", "detail")
         return dict(zip(keys, row))
 
-    def get_securities_codes(self) -> list[str]:
+    def get_securities_codes(self, *, after: str = "", limit: int = -1) -> list[str]:
         with self._session() as db:
-            rows = db.execute("SELECT code FROM securities WHERE status IN ('', '1') ORDER BY code").fetchall()
+            rows = db.execute("""SELECT code FROM securities WHERE code>? AND status IN ('', '1')
+                ORDER BY code LIMIT ?""", (after, limit)).fetchall()
         return [r[0] for r in rows]
 
     def count_securities(self) -> int:
@@ -1481,42 +1487,60 @@ class Storage:
             db.executemany("""INSERT OR REPLACE INTO stock_industry
                 (code, industry, classification, update_date, fetched_at) VALUES (?, ?, ?, ?, ?)""", values)
 
-    def get_daily_gap_codes(self, limit: int, start_date: str, end_date: str,
-                            adjustflags: list[str]) -> list[str]:
-        """Select actual calendar gaps in any requested adjustment, respecting retry time.
-
-        Job success is not evidence of coverage. In particular, a morning success
-        must not suppress a new target after the evening collection time.
-        """
-        if not adjustflags:
-            return []
-        flags_sql = " UNION ALL ".join("SELECT ? AS adjustflag" for _ in adjustflags)
+    def get_daily_gaps(self, start_date: str, end_date: str, adjustflags: list[str],
+                       codes: list[str] | None = None) -> dict[tuple[str, str], dict[str, DailyGap]]:
+        """Read missing trading dates and their retry state using only indexed date keys."""
+        if not adjustflags or codes == []:
+            return {}
+        flags_sql = ",".join("(?)" for _ in adjustflags)
+        code_filter = "" if codes is None else " AND s.code IN (" + ",".join("?" for _ in codes) + ")"
+        gaps: dict[tuple[str, str], dict[str, DailyGap]] = {}
         with self._session() as db:
             rows = db.execute("""
-                SELECT s.code FROM securities s
+                WITH flags(adjustflag) AS (VALUES """ + flags_sql + """)
+                SELECT s.code, f.adjustflag, t.calendar_date, COALESCE(j.attempts, 0), j.next_retry_at
+                FROM securities s CROSS JOIN flags f CROSS JOIN trade_calendar t
+                LEFT JOIN download_jobs j ON j.dataset='daily_bars_gap'
+                  AND j.batch_id=s.code || '|' || f.adjustflag || '|' || t.calendar_date
                 WHERE s.status IN ('', '1')
-                  AND EXISTS (
-                    SELECT 1 FROM (""" + flags_sql + """) f
-                    WHERE NOT EXISTS (
-                        SELECT 1 FROM download_jobs j
-                        WHERE j.dataset='daily_bars'
-                          AND j.batch_id=s.code || '|' || f.adjustflag
-                          AND j.status IN ('waiting_data', 'retryable_failed')
-                          AND j.window_end=? AND j.next_retry_at>?)
-                      AND EXISTS (
-                        SELECT 1 FROM trade_calendar t
-                        WHERE t.is_trading_day=1
-                          AND t.calendar_date BETWEEN ? AND ?
-                          AND (s.ipo_date IS NULL OR s.ipo_date='' OR t.calendar_date>=s.ipo_date)
-                          AND (s.out_date IS NULL OR s.out_date='' OR t.calendar_date<s.out_date)
-                          AND NOT EXISTS (
-                            SELECT 1 FROM daily_bars b
-                            WHERE b.code=s.code AND b.bar_date=t.calendar_date
-                              AND b.frequency='d' AND b.adjustflag=f.adjustflag)))
-                ORDER BY s.code LIMIT ?""",
-                (*adjustflags, end_date, self.clock.now_utc().isoformat(),
-                 start_date, end_date, limit)).fetchall()
-        return [r[0] for r in rows]
+                  AND t.is_trading_day=1 AND t.calendar_date BETWEEN ? AND ?
+                  AND (s.ipo_date IS NULL OR s.ipo_date='' OR t.calendar_date>=s.ipo_date)
+                  AND (s.out_date IS NULL OR s.out_date='' OR t.calendar_date<s.out_date)
+                  AND NOT EXISTS (
+                    SELECT 1 FROM daily_bars b WHERE b.code=s.code AND b.bar_date=t.calendar_date
+                      AND b.frequency='d' AND b.adjustflag=f.adjustflag)
+                """ + code_filter + " ORDER BY s.code",
+                (*adjustflags, start_date, end_date, *(codes or [])))
+            for code, flag, day, attempts, retry_at in rows:
+                gaps.setdefault((code, flag), {})[day] = DailyGap(attempts, retry_at)
+        return gaps
+
+    def record_daily_gap_attempt(self, code: str, adjustflag: str, attempted: dict[str, DailyGap],
+                                 missing: dict[str, DailyGap], base_seconds: int, cap_seconds: int,
+                                 error: str | None = None) -> dict[str, DailyGap]:
+        """Persist streaks only for dates still missing after a request."""
+        now = self.clock.now_utc()
+        remaining = {}
+        for day, gap in missing.items():
+            # Bound the exponent even for a very old unresolved gap.
+            delay = min(base_seconds * 2 ** min(gap.attempts, 20), cap_seconds)
+            remaining[day] = DailyGap(gap.attempts + 1, (now + timedelta(seconds=delay)).isoformat())
+        key = f"{code}|{adjustflag}|"
+        resolved = [(key + day,) for day, gap in attempted.items() if gap.attempts and day not in missing]
+        if remaining or resolved:
+            with self._session() as db:
+                db.executemany("""DELETE FROM download_jobs
+                    WHERE dataset='daily_bars_gap' AND batch_id=?""", resolved)
+                db.executemany("""INSERT INTO download_jobs
+                    (dataset, batch_id, status, attempts, updated_at, next_retry_at, error)
+                    VALUES ('daily_bars_gap', ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(dataset, batch_id) DO UPDATE SET status=excluded.status,
+                        attempts=excluded.attempts, updated_at=excluded.updated_at,
+                        next_retry_at=excluded.next_retry_at, error=excluded.error""",
+                    [(key + day, JOB_RETRYABLE_FAILED if error else JOB_WAITING_DATA,
+                      gap.attempts, now.isoformat(), gap.next_retry_at, error)
+                     for day, gap in remaining.items()])
+        return remaining
 
     # ---------- daily backfill pending selection (断点续传 + 当日去重) ----------
 

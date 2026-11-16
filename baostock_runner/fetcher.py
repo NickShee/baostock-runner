@@ -16,10 +16,12 @@ import datetime
 import json
 import threading
 import time
+from itertools import islice
 from typing import Any
 
 from .config import Settings
 from .gateway import BaoStockGateway
+from .storage import DailyGap, _merge_date_windows
 from .timeutil import Clock, parse_check_time
 
 
@@ -52,6 +54,12 @@ DAILY_FIELDS = (
     "turn,tradestatus,pctChg,peTTM,pbMRQ,psTTM,pcfNcfTTM,isST"
 )
 
+HISTORY_TRADE_DAYS = 63
+HISTORY_CODE_LIMIT = 25
+HISTORY_REQUEST_LIMIT = 8
+HISTORY_SLICE_INTERVAL = datetime.timedelta(minutes=1)
+HISTORY_RESCAN_INTERVAL = datetime.timedelta(days=1)
+
 
 class Fetcher:
     def __init__(self, gateway: BaoStockGateway, settings: Settings | None = None):
@@ -62,6 +70,7 @@ class Fetcher:
         self.clock: Clock = gateway.clock
         self.stop_event = threading.Event()
         self.wake_event = threading.Event()
+        self._history_due_at: datetime.datetime | None = None
         self._state_lock = threading.Lock()
         self._state: dict[str, Any] = {
             "running": False,
@@ -148,8 +157,12 @@ class Fetcher:
                 did_work = self._step_once()
                 if did_work:
                     continue
-                self._set_state(running=False, current="all fetch tasks caught up; idle")
-                self._sleep(self.settings.fetch_idle_sleep_seconds)
+                self._set_state(running=False, current="waiting for next fetch poll")
+                idle_seconds = self.settings.fetch_idle_sleep_seconds
+                if self._history_due_at is not None:
+                    until_history = (self._history_due_at - self.clock.now_utc()).total_seconds()
+                    idle_seconds = min(idle_seconds, max(0.0, until_history))
+                self._sleep(idle_seconds)
             except BudgetExhausted:
                 self._set_state(running=False, current="download budget exhausted; paused until next day")
                 self._sleep(self.settings.fetch_pause_sleep_seconds)
@@ -172,7 +185,7 @@ class Fetcher:
                 "calendar": self._fetch_calendar,
                 "industry": self._fetch_industry,
                 "index_constituents": self._fetch_index,
-                "daily_bars": self._fetch_daily_batch,
+                "daily_bars": lambda: self._fetch_daily_batch(force_history=True),
                 "financials": self._fetch_financial_batch,
                 "dividends": self._fetch_dividends_batch,
                 "adjust_factors": self._fetch_adjust_factors_batch,
@@ -342,7 +355,8 @@ class Fetcher:
         return self.storage.count_securities() > 0
 
     def _adjustflags(self) -> list[str]:
-        return [x.strip() for x in self.settings.fetch_adjustflags.split(",") if x.strip()] or ["3"]
+        return list(dict.fromkeys(flag.strip() for flag in self.settings.fetch_adjustflags.split(",")
+                                  if flag.strip())) or ["3"]
 
     # ---------- C-02: daily_batch 主采集（按日批量接口） ----------
 
@@ -533,71 +547,173 @@ class Fetcher:
                                 rows_written=done)
         return True
 
-    def _fetch_daily_batch(self) -> bool:
+    def _fetch_daily_batch(self, *, force_history: bool = False) -> bool:
         latest = self._latest_trade_date()
         adjustflags = self._adjustflags()
         start = self.settings.fetch_daily_start_date
-        trade_dates = self._trade_dates_in_range(start, latest)
+        trade_dates = self._trade_dates_in_range(
+            start, latest, limit=max(1, self.settings.daily_batch_window_days), newest_first=True)
         if not trade_dates:
-            return False  # Calendar initialization must precede collection.
-
-        # Update the whole pool's recent trading days before historical backfill.
-        recent_start = trade_dates[-min(len(trade_dates), max(1, self.settings.daily_batch_window_days))]
-        pending = self.storage.get_daily_gap_codes(
-            self.settings.fetch_batch_size, recent_start, latest, adjustflags)
-        scope_start = recent_start
-        if not pending:
-            scope_start = start
-            pending = self.storage.get_daily_gap_codes(
-                self.settings.fetch_batch_size, start, latest, adjustflags)
-        if not pending:
+            self._history_due_at = None
             return False
 
-        scope_dates = [d for d in trade_dates if d >= scope_start]
-        self._set_state(current=f"daily backfill: {len(pending)} codes", dataset="daily_bars",
-                        total=len(pending), done=0)
-        did_work = False
-        for code in pending:
-            for af in adjustflags:
-                job_id = f"{code}|{af}"
-                job = self.storage._job_row("daily_bars", job_id)
-                if (job and job["status"] in (self.storage.JOB_WAITING_DATA, self.storage.JOB_RETRYABLE_FAILED)
-                        and job["window_end"] == latest and job["next_retry_at"]
-                        and job["next_retry_at"] > self.clock.now_utc().isoformat()):
-                    continue
-                coverage = self.storage.get_daily_coverage(
-                    [code], scope_start, latest, af, trade_dates=scope_dates)
-                gaps = coverage["per_code"][code]["gap_windows"]
-                for win in gaps:
-                    if self.budget_left() <= 0:
-                        raise BudgetExhausted()
-                    # Request the exact missing window, including historical holes
-                    # even when a newer bar already exists locally.
-                    self.gateway.daily_bars({
-                        "code": code, "fields": DAILY_FIELDS,
-                        "start_date": win["start"], "end_date": win["end"],
-                        "frequency": "d", "adjustflag": af,
-                    }, use_cache=False, force_refresh=True, priority=1, origin="fetcher")
-                    did_work = True
-                remaining = self.storage.get_daily_coverage(
-                    [code], scope_start, latest, af, trade_dates=scope_dates)
-                incomplete = bool(remaining["per_code"][code]["gap_windows"])
-                retry_at = (self.clock.now_utc() + datetime.timedelta(
-                    seconds=max(60, self.settings.fetch_idle_sleep_seconds))).isoformat() if incomplete else None
-                self.storage.job_upsert(
-                    "daily_bars", job_id,
-                    self.storage.JOB_WAITING_DATA if incomplete else self.storage.JOB_SUCCEEDED,
-                    window_start=scope_start, window_end=latest, next_retry_at=retry_at)
-            self._set_state(done=self.state["done"] + 1)
+        recent_start = trade_dates[-1]
+        gaps = self.storage.get_daily_gaps(recent_start, latest, adjustflags)
+        did_work, _ = self._repair_daily_gaps(gaps, recent_start, latest, recent=True)
+        if did_work:
+            return True
+        return self._fetch_daily_history(recent_start, adjustflags, force=force_history)
+
+    def _fetch_daily_history(self, recent_start: str, adjustflags: list[str], *, force: bool) -> bool:
+        history_start = self.settings.fetch_daily_start_date
+        if recent_start <= history_start:
+            self._history_due_at = None
+            return False
+        history_end = (datetime.date.fromisoformat(recent_start) - datetime.timedelta(days=1)).isoformat()
+        now = self.clock.now_utc()
+        scope = [history_start, self.settings.daily_batch_window_days, sorted(set(adjustflags))]
+        meta = self.storage.get_meta("daily_bars_history_scan")
+        cursor = json.loads(meta["detail"]) if meta and meta["detail"] else {}
+        if cursor.get("scope") != scope:
+            cursor = {"scope": scope}
+
+        due_at = cursor.get("due_at")
+        if not force and due_at and due_at > now.isoformat():
+            self._history_due_at = datetime.datetime.fromisoformat(due_at)
+            return False
+        scan_start = cursor.get("start", history_start)
+        scan_end = cursor.get("end")
+        if scan_end is None:
+            dates = self._trade_dates_in_range(scan_start, history_end, limit=HISTORY_TRADE_DAYS)
+            if not dates:
+                self._save_daily_history_cursor({"scope": scope}, HISTORY_RESCAN_INTERVAL)
+                return False
+            scan_end = dates[-1]
+        scan_end = min(scan_end, history_end)
+
+        cpu_started, wall_started = time.thread_time(), time.perf_counter()
+        code_limit = min(HISTORY_CODE_LIMIT, max(1, self.settings.fetch_batch_size))
+        page = self.storage.get_securities_codes(after=cursor.get("after_code", ""), limit=code_limit + 1)
+        codes = page[:code_limit]
+        gaps = self.storage.get_daily_gaps(scan_start, scan_end, adjustflags, codes=codes)
+        self.storage.audit({
+            "interface": "daily_history_scan", "origin": "fetcher", "status": "scanned",
+            "start_date": scan_start, "end_date": scan_end, "codes_checked": len(codes),
+            "missing_dates": sum(len(dates) for dates in gaps.values()),
+            "cpu_ms": round((time.thread_time() - cpu_started) * 1000, 3),
+            "wall_ms": round((time.perf_counter() - wall_started) * 1000, 3),
+        }, self.settings.audit_log_max_bytes)
+
+        # Save the current slice before any network requests so restarts retain its boundaries.
+        cursor.update(start=scan_start, end=scan_end)
+        self._save_daily_history_cursor(cursor, HISTORY_SLICE_INTERVAL)
+        did_work, scanned = self._repair_daily_gaps(
+            gaps, scan_start, scan_end, recent=False, request_limit=HISTORY_REQUEST_LIMIT)
+        if scanned:
+            if len(page) > code_limit:
+                cursor["after_code"] = codes[-1]
+            else:
+                cursor = {"scope": scope,
+                          "start": (datetime.date.fromisoformat(scan_end) + datetime.timedelta(days=1)).isoformat()}
+        self._save_daily_history_cursor(cursor, HISTORY_SLICE_INTERVAL)
         return did_work
 
-    def _trade_dates_in_range(self, start_date: str, end_date: str) -> list[str]:
+    def _save_daily_history_cursor(self, cursor: dict, interval: datetime.timedelta) -> None:
+        self._history_due_at = self.clock.now_utc() + interval
+        self.storage.set_meta("daily_bars_history_scan", json.dumps({
+            **cursor, "due_at": self._history_due_at.isoformat(),
+        }))
+
+    def _repair_daily_gaps(self, gaps: dict[tuple[str, str], dict[str, DailyGap]],
+                           scope_start: str, scope_end: str, *, recent: bool,
+                           request_limit: int | None = None) -> tuple[bool, bool]:
+        now = self.clock.now_utc().isoformat()
+        due = {key: [day for day, gap in dates.items() if not gap.next_retry_at or gap.next_retry_at <= now]
+               for key, dates in gaps.items()}
+        pending = list(dict.fromkeys(code for (code, _), days in due.items() if days))
+        if recent and self.settings.fetch_batch_size >= 0:
+            pending = pending[:self.settings.fetch_batch_size]
+        if not pending:
+            return False, True
+
+        scope = "recent" if recent else "history"
+        self._set_state(current=f"daily {scope} backfill: {len(pending)} codes", dataset="daily_bars",
+                        total=len(pending), done=0)
+        request_count = 0
+        adjustflags = self._adjustflags()
+        for code in pending:
+            for af in adjustflags:
+                days = due.get((code, af))
+                if not days:
+                    continue
+                remaining = gaps[(code, af)]
+                attempted_window = False
+                try:
+                    windows = _merge_date_windows(days)
+                    sorted_days = iter(sorted(days))
+                    for win in windows:
+                        if request_limit is not None and request_count >= request_limit:
+                            return True, False
+                        if self.budget_left() <= 0:
+                            raise BudgetExhausted()
+                        attempted = {day: remaining[day] for day in islice(sorted_days, win["days"])}
+                        request_count += 1
+                        attempted_window = True
+                        self._fetch_daily_window(code, af, win["start"], win["end"],
+                                                 attempted, remaining, recent=recent)
+                finally:
+                    if recent and attempted_window:
+                        next_retry = min((gap.next_retry_at or "" for gap in remaining.values()), default="")
+                        self.storage.job_upsert(
+                            "daily_bars", f"{code}|{af}",
+                            self.storage.JOB_WAITING_DATA if remaining else self.storage.JOB_SUCCEEDED,
+                            window_start=scope_start, window_end=scope_end, next_retry_at=next_retry or None)
+            self._set_state(done=self.state["done"] + 1)
+        return request_count > 0, True
+
+    def _fetch_daily_window(self, code: str, adjustflag: str, start_date: str, end_date: str,
+                            attempted: dict[str, DailyGap], remaining: dict[str, DailyGap], *, recent: bool) -> None:
+        error = None
+        try:
+            self.gateway.daily_bars({
+                "code": code, "fields": DAILY_FIELDS,
+                "start_date": start_date, "end_date": end_date,
+                "frequency": "d", "adjustflag": adjustflag,
+            }, use_cache=False, force_refresh=True, priority=1, origin="fetcher")
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"[:1000]
+            raise
+        finally:
+            cpu_started, wall_started = time.thread_time(), time.perf_counter()
+            missing = self.storage.get_daily_gaps(start_date, end_date, [adjustflag], codes=[code]).get(
+                (code, adjustflag), {})
+            unresolved = {day: missing[day] for day in attempted if day in missing}
+            base_seconds = max(60 if recent else 900, self.settings.fetch_idle_sleep_seconds)
+            backoff = self.storage.record_daily_gap_attempt(
+                code, adjustflag, attempted, unresolved, base_seconds,
+                max(base_seconds, 3600 if recent else 86400), error=error)
+            for day in attempted:
+                del remaining[day]
+            remaining.update(backoff)
+            self.storage.audit({
+                "interface": "daily_bars_backfill", "origin": "fetcher", "status": "verified",
+                "code": code, "adjustflag": adjustflag, "start_date": start_date, "end_date": end_date,
+                "days_filled": len(attempted) - len(backoff), "remaining_dates": list(backoff),
+                "next_retry_at": min((gap.next_retry_at for gap in backoff.values()), default=None),
+                "error": error,
+                "cpu_ms": round((time.thread_time() - cpu_started) * 1000, 3),
+                "wall_ms": round((time.perf_counter() - wall_started) * 1000, 3),
+            }, self.settings.audit_log_max_bytes)
+
+    def _trade_dates_in_range(self, start_date: str, end_date: str, *,
+                              limit: int = -1, newest_first: bool = False) -> list[str]:
         """读取本地交易日历在 [start, end] 内的交易日列表（用于覆盖检查）。"""
+        order = "DESC" if newest_first else "ASC"
         with self.storage._session() as db:
             rows = db.execute(
                 "SELECT calendar_date FROM trade_calendar "
-                "WHERE is_trading_day=1 AND calendar_date BETWEEN ? AND ? ORDER BY calendar_date",
-                (start_date, end_date)).fetchall()
+                f"WHERE is_trading_day=1 AND calendar_date BETWEEN ? AND ? ORDER BY calendar_date {order} LIMIT ?",
+                (start_date, end_date, limit)).fetchall()
         return [r[0] for r in rows]
 
     # ---------- financials backfill (A-03: 状态机 + 修订检查 + 退避) ----------
