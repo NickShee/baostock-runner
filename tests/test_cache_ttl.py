@@ -32,6 +32,7 @@ def _settings(directory, **kw):
         log_path=os.path.join(directory, "audit.jsonl"),
         min_interval_seconds=0,
         daily_hard_limit=1000,
+        offline=True,
         cache_ttl_empty_seconds=900,          # 15min
         cache_ttl_recent_quotes_seconds=900,  # 15min
         cache_ttl_historical_quotes_seconds=7 * 86400,

@@ -100,8 +100,11 @@ class StorageFetchSchemaTest(unittest.TestCase):
             self.assertEqual(storage.download_usage_today(), 2)
 
     def test_daily_pending_codes_and_today_dedup(self):
+        # The Shanghai business day has changed while the UTC audit date is still yesterday.
+        current = datetime.datetime.fromisoformat("2026-09-16T07:00:00+08:00")
+        clock = Clock(now_fn=lambda: current)
         with tempfile.TemporaryDirectory() as d:
-            storage = Storage(db_path=os.path.join(d, "data.sqlite3"), log_path=os.path.join(d, "audit.jsonl"))
+            storage = Storage(db_path=os.path.join(d, "data.sqlite3"), log_path=os.path.join(d, "audit.jsonl"), clock=clock)
             storage.put_securities([
                 {"code": "sh.600000", "name": "浦发", "status": "1"},
                 {"code": "sz.000001", "name": "平安", "status": "1"},
@@ -116,6 +119,8 @@ class StorageFetchSchemaTest(unittest.TestCase):
             storage.job_upsert("daily_bars", "sz.000001|3", "succeeded")
             pending2 = storage.get_daily_pending_codes(limit=10, end_date="2026-09-16", primary_adjustflag="3")
             self.assertEqual(pending2, [])
+            current += datetime.timedelta(days=1)
+            self.assertEqual(set(storage.get_daily_pending_codes(10, "2026-09-16", "3")), set(pending))
 
     def test_job_stats(self):
         with tempfile.TemporaryDirectory() as d:

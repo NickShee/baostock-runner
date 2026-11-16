@@ -1572,7 +1572,8 @@ class Storage:
     # ---------- daily backfill pending selection (断点续传 + 当日去重) ----------
 
     def get_daily_pending_codes(self, limit: int, end_date: str, primary_adjustflag: str) -> list[str]:
-        today = self._business_day()
+        day_start = self.clock.now_shanghai().replace(hour=0, minute=0, second=0, microsecond=0)
+        next_day = day_start + timedelta(days=1)
         with self._session() as db:
             rows = db.execute("""
                 SELECT s.code FROM securities s
@@ -1584,7 +1585,10 @@ class Storage:
                 WHERE s.status IN ('', '1')
                   AND (b.m IS NULL OR b.m < ?)
                   -- SQL 三值逻辑：LEFT JOIN 无匹配时 j.* 为 NULL，必须显式放行
-                  AND (j.batch_id IS NULL OR NOT (j.status='succeeded' AND substr(j.updated_at, 1, 10) = ?))
+                  AND (j.batch_id IS NULL OR NOT (j.status='succeeded'
+                       AND julianday(j.updated_at) >= julianday(?)
+                       AND julianday(j.updated_at) < julianday(?)))
                 ORDER BY s.code
-                LIMIT ?""", (primary_adjustflag, primary_adjustflag, end_date, today, limit)).fetchall()
+                LIMIT ?""", (primary_adjustflag, primary_adjustflag, end_date,
+                                day_start.isoformat(), next_day.isoformat(), limit)).fetchall()
         return [r[0] for r in rows]
