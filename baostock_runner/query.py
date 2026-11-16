@@ -7,6 +7,8 @@ import binascii
 import re
 from typing import Any
 
+from .chip_distribution import HISTORY_START, estimate_chip_distribution
+
 CODE = re.compile(r"(?:sh|sz|bj)\.\d{6}\Z")
 DAILY_FIELDS = frozenset("date code open high low close preclose volume amount pctChg turn tradestatus isST peTTM pbMRQ psTTM pcfNcfTTM".split())
 FINANCIAL_DATASETS = frozenset({"profit", "growth", "balance", "cash_flow", "operation", "dupont"})
@@ -69,6 +71,20 @@ class QueryService:
                 "adjust": adjust, "next_cursor": next_cursor}
         return {"rows": rows, "data": rows, "count": len(rows), "coverage": coverage,
                 "next_cursor": next_cursor, "metadata": meta}
+
+    def chip_distribution(self, code: str, observation_date: str) -> dict[str, Any]:
+        valid_code(code)
+        valid_date(observation_date)
+        if observation_date > self.gateway.clock.business_date().isoformat():
+            raise ValueError("date must not be in the future")
+        calendar, rows = self.storage.chip_price_history(code, HISTORY_START, observation_date)
+        return estimate_chip_distribution(code, observation_date, calendar, rows)
+
+    def macd_input(self, code: str) -> dict[str, Any]:
+        valid_code(code)
+        today = self.gateway.clock.business_date().isoformat()
+        return {"code": code, "adjustflag": "1",
+                "closes": self.storage.backward_close_history(code, HISTORY_START, today)}
 
     def financials(self, code: str, dataset: str, limit: int | None = None,
                    cursor: str | None = None) -> dict[str, Any]:

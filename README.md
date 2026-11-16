@@ -8,7 +8,9 @@
 `/healthz` 检查本地数据库与任务服务，`/readyz` 表示本地查询可服务，均单独报告上游状态。
 
 `GET /api/stocks`、`GET /api/stocks/{code}/daily`、`GET /api/stocks/{code}/financials`
-默认游标分页 500 行，`limit` 上限 5000；`POST /api/stocks/{code}/daily/refresh`
+`GET /api/stocks/{code}/chip-distribution?date=YYYY-MM-DD` 按需从 SQLite 估算当日筹码，返回观察日价格口径下的 100 档分布、筹码峰和中央 70% 区间。需要至少 60 条有效交易日，从 2018 年起读取历史，使用同日后复权与不复权收盘价换算价位；输出为模型估算。`GET /api/stocks/{code}/macd-input` 返回精简的后复权收盘价序列，供前端计算日线 MACD。
+
+证券查询默认游标分页 500 行，`limit` 上限 5000；`POST /api/stocks/{code}/daily/refresh`
 返回 202 与 `job_id`，`GET /api/jobs/{job_id}` 查询进度。研究接口包括
 `PUT /api/research/watchlist`、`POST /api/research/universes`、`POST /api/research/screens`、
 `POST /api/research/backtests` 与 `/api/research/export/{kind}/{run_id}`。

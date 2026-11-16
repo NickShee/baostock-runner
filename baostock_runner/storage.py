@@ -679,6 +679,33 @@ class Storage:
                 "tradestatus", "isST", "peTTM", "pbMRQ", "psTTM", "pcfNcfTTM")
         return [dict(zip(keys, row)) for row in rows]
 
+    def chip_price_history(self, code: str, start_date: str, end_date: str):
+        with self._session() as db:
+            calendar, rows = db.execute(
+                "SELECT is_trading_day FROM trade_calendar WHERE calendar_date=?", (end_date,)
+            ).fetchone(), db.execute(
+                """SELECT raw.bar_date, raw.tradestatus, raw.low, raw.high, raw.close,
+                          raw.volume, raw.amount, raw.turn, adjusted.close
+                   FROM daily_bars AS raw
+                   LEFT JOIN daily_bars AS adjusted ON adjusted.code=raw.code
+                     AND adjusted.bar_date=raw.bar_date AND adjusted.frequency='d' AND adjusted.adjustflag='1'
+                   WHERE raw.code=? AND raw.frequency='d' AND raw.adjustflag='3'
+                     AND raw.bar_date BETWEEN ? AND ? ORDER BY raw.bar_date""",
+                (code, start_date, end_date),
+            ).fetchall()
+        return calendar[0] if calendar else None, rows
+
+    def backward_close_history(self, code: str, start_date: str, end_date: str):
+        with self._session() as db:
+            rows = db.execute(
+                """SELECT bar_date, close FROM daily_bars
+                   WHERE code=? AND frequency='d' AND adjustflag='1'
+                     AND bar_date BETWEEN ? AND ? AND close>0 AND tradestatus IS NOT '0'
+                   ORDER BY bar_date""",
+                (code, start_date, end_date),
+            ).fetchall()
+        return rows
+
     def get_daily_bars_asof(self, code: str, frequency: str, adjustflag: str,
                             start_date: str, end_date: str, observed_on_or_before: str) -> list[dict[str, Any]]:
         """Reconstruct the latest version actually observed by a historical date."""

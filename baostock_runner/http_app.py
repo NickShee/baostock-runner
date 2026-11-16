@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import uuid
 
+from starlette.concurrency import run_in_threadpool
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse, FileResponse, RedirectResponse, PlainTextResponse
 from starlette.routing import Route
@@ -156,6 +157,12 @@ def build_http_app(mcp, gateway, fetcher, settings):
         adjust = {"3": "none", "2": "forward", "1": "backward"}.get(request.query_params.get("adjustflag", "3"))
         return query.daily(code, start, end, adjust, limit=n(request, "limit", 500), cursor=request.query_params.get("cursor"))
 
+    async def chip_distribution(request):
+        return await run_in_threadpool(query.chip_distribution, request.path_params["code"], request.query_params.get("date"))
+
+    async def macd_input(request):
+        return await run_in_threadpool(query.macd_input, request.path_params["code"])
+
     async def financials(request):
         return query.financials(request.path_params["code"], request.query_params.get("dataset", "profit"),
                                 n(request, "limit", 500), request.query_params.get("cursor"))
@@ -225,6 +232,8 @@ def build_http_app(mcp, gateway, fetcher, settings):
         Route("/api/dashboard/errors", respond(errors)),
         Route("/api/stocks", respond(stocks)),
         Route("/api/stocks/{code}/daily", respond(daily)),
+        Route("/api/stocks/{code}/chip-distribution", respond(chip_distribution)),
+        Route("/api/stocks/{code}/macd-input", respond(macd_input)),
         Route("/api/stocks/{code}/financials", respond(financials)),
         Route("/api/stocks/{code}/daily/refresh", respond_accepted(refresh), methods=["POST"]),
         Route("/api/jobs/{job_id}", respond(job)),
