@@ -43,7 +43,8 @@ def _ready_storage(storage, fetcher):
     try:
         storage.put_securities([{"code": "sh.600000", "name": "浦发", "status": "1"}])
         storage.set_meta("stock_industry", detail="ready")
-        storage.set_meta("index_constituents", detail="ready")
+        for index in ("hs300", "sz50", "zz500"):
+            storage.put_index_constituents(index, fetcher.business_today, [{"code": "sh.600000"}])
         today = fetcher.business_today
         storage.put_trade_calendar([
             {"calendar_date": today, "is_trading_day": 1},

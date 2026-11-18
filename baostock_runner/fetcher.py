@@ -197,8 +197,8 @@ class Fetcher:
             return self._fetch_calendar()
         if self._need_industry():
             return self._fetch_industry()
-        if self._need_index_refresh():
-            return self._fetch_index()
+        if self._fetch_index():
+            return True
         # C-02: daily_batch 模式优先做每日主采集；无活后回落到逐股缺口/历史路径。
         if self.settings.fetch_mode == "daily_batch":
             if self._fetch_daily_batch_mode():
@@ -223,13 +223,8 @@ class Fetcher:
             self._set_state(last_error=f"universe '{self.settings.fetch_universe}' not supported in P1")
             return False
         self._set_state(current="init: fetching hs300 constituents")
-        res = self._bounded_call("query_hs300_stocks", {})
-        constituents = res["data"]
-        if not constituents:
-            raise RuntimeError("query_hs300_stocks returned no constituents")
         today = self.business_today
-        self.storage.put_index_constituents("hs300", today, constituents)
-        codes = [r["code"] for r in constituents]
+        codes = self.storage.get_index_codes("hs300", today) or self._download_index_codes("hs300", today)
         basic_res = self._bounded_call("query_stock_basic", {"code": "", "code_name": ""})
         basic_by_code = {r["code"]: r for r in basic_res["data"]}
         rows = []
@@ -311,23 +306,27 @@ class Fetcher:
         self._set_state(current=f"industry refreshed: {len(rows)} rows")
         return True
 
-    def _need_index_refresh(self) -> bool:
-        meta = self.storage.get_meta("index_constituents")
-        if meta is None:
-            return True
-        return not meta.get("last_updated", "").startswith(self.business_today)
+    def _download_index_codes(self, index: str, day: str) -> list[str]:
+        method = f"query_{index}_stocks"
+        result = self._bounded_call(method, {})
+        rows = [{"code": r["code"], "name": r.get("code_name", "")}
+                for r in result["data"] if r.get("code")]
+        if not rows:
+            raise RuntimeError(f"{method} returned no constituents")
+        self.storage.put_index_constituents(index, day, rows)
+        return [r["code"] for r in rows]
 
     def _fetch_index(self) -> bool:
-        self._set_state(current="refreshing index constituents")
         today = self.business_today
-        for index_code, method in (
-            ("hs300", "query_hs300_stocks"),
-            ("sz50", "query_sz50_stocks"),
-            ("zz500", "query_zz500_stocks"),
-        ):
-            res = self._bounded_call(method, {})
-            rows = [{"code": r["code"], "name": r.get("code_name", "")} for r in res["data"] if r.get("code")]
-            self.storage.put_index_constituents(index_code, today, rows)
+        missing = self.storage.missing_index_snapshots(("hs300", "sz50", "zz500"), today)
+        if not missing:
+            return False
+        self._set_state(current="refreshing index constituents")
+        for index in missing:
+            # Re-evaluate the outstanding indices if the batch crosses Shanghai midnight.
+            if self.business_today != today:
+                return True
+            self._download_index_codes(index, today)
         self.storage.set_meta("index_constituents", detail=f"asof={today}")
         self._set_state(current=f"index constituents refreshed asof={today}")
         return True

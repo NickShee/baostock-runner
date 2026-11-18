@@ -1332,6 +1332,13 @@ class Storage:
                     name=excluded.name,
                     fetched_at=MIN(index_constituents.fetched_at, excluded.fetched_at)""", values)
 
+    def missing_index_snapshots(self, indices: tuple[str, ...], asof_date: str) -> list[str]:
+        # Each nonempty snapshot is committed in one transaction under its Shanghai date.
+        with self._session() as db:
+            return [index for index in indices if db.execute(
+                "SELECT 1 FROM index_constituents WHERE index_code=? AND asof_date=? LIMIT 1",
+                (index, asof_date)).fetchone() is None]
+
     def get_index_codes(self, index_code: str, asof_date: str | None = None) -> list[str]:
         with self._session() as db:
             if asof_date:

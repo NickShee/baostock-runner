@@ -54,7 +54,8 @@ def _ready_storage(storage, fetcher, days=("2026-09-23", "2026-09-24")):
         storage.put_securities([{"code": "sh.600000", "name": "浦发", "status": "1"},
                                 {"code": "sz.000001", "name": "平安", "status": "1"}])
         storage.set_meta("stock_industry", detail="ready")
-        storage.set_meta("index_constituents", detail="ready")
+        for index in ("hs300", "sz50", "zz500"):
+            storage.put_index_constituents(index, fetcher.business_today, [{"code": "sh.600000"}])
         calendar = [{"calendar_date": "2099-01-01", "is_trading_day": 1}]
         for d in days:
             calendar.append({"calendar_date": d, "is_trading_day": 1})
